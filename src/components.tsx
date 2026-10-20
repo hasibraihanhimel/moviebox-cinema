@@ -260,7 +260,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   const streamIndex = streamSelection?.streams === playableStreams ? streamSelection.index : startupIndex < 0 ? 0 : startupIndex;
   const stream = playableStreams[streamIndex];
   const effectiveStream = stream && compatibilityMode && stream.compatibility_url
-    ? { ...stream, playback_url: stream.compatibility_url, format: "MP4", is_dash: false }
+    ? { ...stream, url: stream.compatibility_url, playback_url: stream.compatibility_url, format: "MP4", is_dash: false }
     : stream;
   const qualityOptions = useMemo(() => playableStreams.filter((value, index, list) => list.findIndex((candidate) => candidate.quality === value.quality) === index), [playableStreams]);
 
@@ -323,6 +323,16 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !stream || !effectiveStream) return;
+    if (!allowed) {
+      engineRef.current?.destroy();
+      engineRef.current = null;
+      expectedMediaSourceRef.current = "";
+      video.removeAttribute("src");
+      video.load();
+      setError("");
+      setBuffering(false);
+      return;
+    }
     let active = true;
     const startAt = compatibilityMode ? 0 : video.currentTime > 0 ? video.currentTime : initialPosition;
     const shouldResume = Boolean(!video.paused && allowed);
@@ -341,7 +351,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
       if (active) recoverPlaybackFailure(streamIndex, video.error?.code);
     });
     return () => { active = false; engine.destroy(); if (engineRef.current === engine) engineRef.current = null; if (shouldResume) resumeAfterLoadRef.current = true; };
-  }, [effectiveStream?.playback_url, effectiveStream?.url, compatibilityMode, sourceAttempt]);
+  }, [effectiveStream?.playback_url, effectiveStream?.url, compatibilityMode, sourceAttempt, allowed]);
   useEffect(() => {
     if (!selectedCaption) { setCaptionSrc(""); return; }
     const controller = new AbortController();

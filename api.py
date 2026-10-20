@@ -1169,11 +1169,27 @@ def playback_compatibility_transcode(token: str, request: Request):
         "-f", "mp4", "pipe:1",
     ]
     try:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     except OSError as exc:
         _COMPAT_TRANSCODE_SLOTS.release()
         logger.warning("Could not start compatibility transcode: %s", exc)
         raise HTTPException(status_code=503, detail="Compatibility playback could not start.") from exc
+
+    def log_transcode_errors():
+        if process.stderr is None:
+            return
+        try:
+            for raw_line in iter(process.stderr.readline, b""):
+                message = raw_line.decode("utf-8", errors="replace").strip()
+                # FFmpeg can include the signed local playback URL in protocol errors.
+                message = re.sub(r"https?://[^\s]+", "[playback URL redacted]", message)
+                if message:
+                    logger.warning("Compatibility transcode: %s", message[:500])
+        except (OSError, ValueError):
+            pass
+
+    stderr_thread = threading.Thread(target=log_transcode_errors, daemon=True)
+    stderr_thread.start()
 
     def body():
         try:
@@ -1197,6 +1213,9 @@ def playback_compatibility_transcode(token: str, request: Request):
                 process.wait()
             if process.stdout:
                 process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            stderr_thread.join(timeout=1)
             _COMPAT_TRANSCODE_SLOTS.release()
 
     return StreamingResponse(body(), media_type="video/mp4", headers=headers)
