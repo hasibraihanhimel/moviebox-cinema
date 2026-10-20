@@ -56,6 +56,7 @@ export interface Stream {
   duration_sec?: number | null;
   headers?: Record<string, string>;
   playback_url?: string;
+  compatibility_url?: string;
   is_dash?: boolean;
   is_browser_playable?: boolean;
   requires_proxy?: boolean;

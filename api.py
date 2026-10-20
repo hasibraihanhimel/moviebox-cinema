@@ -7,9 +7,12 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import ssl
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode, urljoin, urlsplit
@@ -131,6 +134,8 @@ PROXY_SIGNING_SECRET = os.getenv("PROXY_SIGNING_SECRET") or hashlib.sha256(
 # Playback URLs are also used by the browser for every DASH segment request.
 # Keep their signatures alive for a full feature film, including pauses.
 PROXY_TOKEN_TTL_SECONDS = max(60, int(os.getenv("PROXY_TOKEN_TTL_SECONDS", "21600")))
+COMPAT_TRANSCODE_LIMIT = max(1, int(os.getenv("COMPAT_TRANSCODE_LIMIT", "1")))
+_COMPAT_TRANSCODE_SLOTS = threading.BoundedSemaphore(COMPAT_TRANSCODE_LIMIT)
 ALLOWED_MEDIA_HOSTS = {
     "aoneroom.com",
     "hakunaymatata.com",
@@ -316,7 +321,10 @@ def _normalize_stream(stream: Dict[str, Any]) -> Dict[str, Any]:
     stream["is_browser_playable"] = bool(is_mp4 or is_dash)
     stream["requires_headers"] = requires_headers
     stream["requires_proxy"] = True
-    stream["playback_url"] = f"/api/playback/{_encode_playback_token({'url': url, 'headers': stream.get('headers') or {}, 'cookie': stream.get('cookie') or '', 'kind': 'dash' if is_dash else 'media', 'mime_type': 'application/dash+xml' if is_dash else 'video/mp4' if is_mp4 else ''})}"
+    playback_token = _encode_playback_token({"url": url, "headers": stream.get("headers") or {}, "cookie": stream.get("cookie") or "", "kind": "dash" if is_dash else "media", "mime_type": "application/dash+xml" if is_dash else "video/mp4" if is_mp4 else ""})
+    stream["playback_url"] = f"/api/playback/{playback_token}"
+    if is_mp4 or is_dash:
+        stream["compatibility_url"] = f"/api/playback/{playback_token}/compat"
     return stream
 
 
@@ -1124,6 +1132,74 @@ def playback_manifest_or_media(token: str, request: Request):
     gateway_base = f"/api/playback/{token}/"
     manifest = _rewrite_dash_manifest(manifest, gateway_base)
     return Response(content=manifest, media_type="application/dash+xml", headers={"Cache-Control": "no-store"})
+
+@app.api_route("/api/playback/{token}/compat", methods=["GET", "HEAD"])
+def playback_compatibility_transcode(token: str, request: Request):
+    """Convert a resolved stream to broadly supported H.264/AAC fragmented MP4."""
+    payload = _decode_playback_token(token)
+    if payload.get("kind") not in {"media", "dash"}:
+        raise HTTPException(status_code=404, detail="Compatibility playback is unavailable for this stream.")
+    headers = {
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "none",
+        "X-Accel-Buffering": "no",
+    }
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="video/mp4", headers=headers)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=503, detail="Compatibility playback is unavailable on this server.")
+    if not _COMPAT_TRANSCODE_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="The compatibility player is busy. Please retry shortly.")
+
+    port = int(os.getenv("PORT", "8000"))
+    local_source = f"http://127.0.0.1:{port}/api/playback/{token}"
+    command = [
+        ffmpeg,
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "30000000",
+        "-protocol_whitelist", "http,tcp,https,tls,crypto,data",
+        "-i", local_source,
+        "-map", "0:v:0", "-map", "0:a:0?", "-sn",
+        "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
+        "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-profile:v", "baseline", "-level:v", "3.1", "-crf", "22", "-bf", "0", "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "2000000",
+        "-f", "mp4", "pipe:1",
+    ]
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    except OSError as exc:
+        _COMPAT_TRANSCODE_SLOTS.release()
+        logger.warning("Could not start compatibility transcode: %s", exc)
+        raise HTTPException(status_code=503, detail="Compatibility playback could not start.") from exc
+
+    def body():
+        try:
+            if process.stdout is None:
+                return
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+            return_code = process.wait()
+            if return_code:
+                logger.warning("Compatibility transcode exited with status %s", return_code)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if process.stdout:
+                process.stdout.close()
+            _COMPAT_TRANSCODE_SLOTS.release()
+
+    return StreamingResponse(body(), media_type="video/mp4", headers=headers)
 
 @app.api_route("/api/playback/{token}/{asset:path}", methods=["GET", "HEAD"])
 def playback_dash_asset(token: str, asset: str, request: Request):

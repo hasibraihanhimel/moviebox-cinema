@@ -220,9 +220,11 @@ function playbackFailureMessage(code?: number): string {
 export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, onProgress, onRetry, onEnded }: { streams: Stream[]; captions: Subtitle[]; allowed: boolean; initialPosition?: number; onProgress?: (position: number, duration: number) => void; onRetry?: () => void; onEnded?: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const engineRef = useRef<PlaybackEngine | null>(null);
+  const expectedMediaSourceRef = useRef("");
   const resumeAfterLoadRef = useRef(false);
   const saveRef = useRef(0);
-  const [streamIndex, setStreamIndex] = useState(0);
+  const [streamSelection, setStreamSelection] = useState<{ streams: Stream[]; index: number } | null>(null);
+  const [compatibilityMode, setCompatibilityMode] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(true);
   const [duration, setDuration] = useState(0);
@@ -240,8 +242,9 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   const hideTimer = useRef<number | undefined>(undefined);
   const failedStreamIndices = useRef(new Set<number>());
   const lastAutoFallbackFrom = useRef<number | null>(null);
+  const compatibilityAttemptedFor = useRef<number | null>(null);
   const playableStreams = useMemo(() => {
-    const browserPlayable = streams.filter(browserCanPlayStream);
+    const browserPlayable = streams.filter((candidate) => Boolean(candidate.compatibility_url) || browserCanPlayStream(candidate));
     // Prefer broadly supported H.264 MP4 sources when the provider returns
     // them; some Chromium builds claim HEVC support but still cannot decode it.
     const hasH264Mp4 = browserPlayable.some((candidate) =>
@@ -249,8 +252,19 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     );
     return hasH264Mp4 ? browserPlayable.filter((candidate) => !isHevcStream(candidate)) : browserPlayable;
   }, [streams]);
+  const startupIndex = useMemo(() => playableStreams.reduce((best, candidate, index, list) => {
+    const quality = Number(candidate.quality_value || candidate.quality.match(/\d+/)?.[0] || 0);
+    const bestQuality = best < 0 ? 0 : Number(list[best]?.quality_value || list[best]?.quality.match(/\d+/)?.[0] || 0);
+    return quality <= 720 && quality > bestQuality ? index : best;
+  }, -1), [playableStreams]);
+  const streamIndex = streamSelection?.streams === playableStreams ? streamSelection.index : startupIndex < 0 ? 0 : startupIndex;
   const stream = playableStreams[streamIndex];
+  const effectiveStream = stream && compatibilityMode && stream.compatibility_url
+    ? { ...stream, playback_url: stream.compatibility_url, format: "MP4", is_dash: false }
+    : stream;
   const qualityOptions = useMemo(() => playableStreams.filter((value, index, list) => list.findIndex((candidate) => candidate.quality === value.quality) === index), [playableStreams]);
+
+  function selectStream(index: number) { setStreamSelection({ streams: playableStreams, index }); }
 
   useEffect(() => {
     const video = videoRef.current;
@@ -266,46 +280,68 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     if (nextIndex < 0) return false;
     lastAutoFallbackFrom.current = index;
     resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused && allowed);
-    setError(""); setBuffering(true); setStreamIndex(nextIndex);
+    setError(""); setBuffering(true); setCompatibilityMode(false); selectStream(nextIndex);
     return true;
+  }
+
+  function tryCompatibilityPlayback(index: number, code?: number): boolean {
+    if (compatibilityMode || (code !== 2 && code !== 3 && code !== 4 && !playableStreams[index]?.is_dash)) return false;
+    const preferredIndex = playableStreams.reduce((best, candidate, candidateIndex, list) => {
+      if (!candidate.compatibility_url) return best;
+      const quality = Number(candidate.quality_value || candidate.quality.match(/\d+/)?.[0] || 0);
+      const bestQuality = best < 0 ? 0 : Number(list[best]?.quality_value || list[best]?.quality.match(/\d+/)?.[0] || 0);
+      return quality <= 720 && quality > bestQuality ? candidateIndex : best;
+    }, -1);
+    const candidateIndex = preferredIndex >= 0 ? preferredIndex : playableStreams.findIndex((candidate) => Boolean(candidate.compatibility_url));
+    if (candidateIndex < 0) return false;
+    if (compatibilityAttemptedFor.current === candidateIndex) return true;
+    compatibilityAttemptedFor.current = candidateIndex;
+    resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused && allowed);
+    setError(""); setBuffering(true); setCompatibilityMode(true);
+    if (candidateIndex !== index) selectStream(candidateIndex);
+    return true;
+  }
+
+  function recoverPlaybackFailure(index: number, code?: number, message?: string) {
+    if (!compatibilityMode && advanceAfterFailure(index)) return;
+    if (!compatibilityMode && tryCompatibilityPlayback(index, code)) return;
+    setBuffering(false);
+    setError(compatibilityMode
+      ? "This browser couldn't play the converted stream. Resolve again or try another source."
+      : message || playbackFailureMessage(code));
   }
 
   useEffect(() => {
     failedStreamIndices.current.clear();
     lastAutoFallbackFrom.current = null;
-    const startupIndex = playableStreams.reduce((best, candidate, index, list) => {
-      const quality = Number(candidate.quality_value || candidate.quality.match(/\d+/)?.[0] || 0);
-      const bestQuality = best < 0 ? 0 : Number(list[best]?.quality_value || list[best]?.quality.match(/\d+/)?.[0] || 0);
-      return quality <= 720 && quality > bestQuality ? index : best;
-    }, -1);
+    compatibilityAttemptedFor.current = null;
+    setCompatibilityMode(false);
     setPositionApplied(false);
-    setStreamIndex(startupIndex < 0 ? 0 : startupIndex);
+    setStreamSelection({ streams: playableStreams, index: startupIndex < 0 ? 0 : startupIndex });
   }, [playableStreams]);
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !stream) return;
+    if (!video || !stream || !effectiveStream) return;
     let active = true;
-    const startAt = video.currentTime > 0 ? video.currentTime : initialPosition;
+    const startAt = compatibilityMode ? 0 : video.currentTime > 0 ? video.currentTime : initialPosition;
     const shouldResume = Boolean(!video.paused && allowed);
     setError(""); setBuffering(true);
     video.pause();
+    expectedMediaSourceRef.current = new URL(resolveApiUrl(effectiveStream.playback_url || effectiveStream.url), window.location.href).href;
     engineRef.current?.destroy();
-    const engine = createPlaybackEngine(video, stream, (diagnostic: PlaybackError) => {
+    const engine = createPlaybackEngine(video, effectiveStream, (diagnostic: PlaybackError) => {
       if (import.meta.env.DEV) console.error("[MovieBox playback] DASH error", diagnostic);
-      if (active && !advanceAfterFailure(streamIndex)) {
-        setBuffering(false);
-        setError(diagnostic.message || "The selected stream could not be loaded.");
-      }
+      if (active) recoverPlaybackFailure(streamIndex, diagnostic.code, diagnostic.message || "The selected stream could not be loaded.");
     });
     engineRef.current = engine;
-    engine.load(stream, startAt).then(() => {
+    engine.load(effectiveStream, startAt).then(() => {
       if (active) setBuffering(false);
     }).catch(() => {
-      if (active && !advanceAfterFailure(streamIndex)) { setBuffering(false); setError(playbackFailureMessage(video.error?.code)); }
+      if (active) recoverPlaybackFailure(streamIndex, video.error?.code);
     });
     return () => { active = false; engine.destroy(); if (engineRef.current === engine) engineRef.current = null; if (shouldResume) resumeAfterLoadRef.current = true; };
-  }, [stream?.playback_url, stream?.url, sourceAttempt]);
+  }, [effectiveStream?.playback_url, effectiveStream?.url, compatibilityMode, sourceAttempt]);
   useEffect(() => {
     if (!selectedCaption) { setCaptionSrc(""); return; }
     const controller = new AbortController();
@@ -321,8 +357,8 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
       if (!video) return;
       if (event.key === " ") { event.preventDefault(); void togglePlay(); }
       if (event.key.toLowerCase() === "m") setMuted((current) => !current);
-      if (event.key === "ArrowRight") video.currentTime = Math.min(video.duration || 0, video.currentTime + 10);
-      if (event.key === "ArrowLeft") video.currentTime = Math.max(0, video.currentTime - 10);
+      if (event.key === "ArrowRight" && !compatibilityMode) video.currentTime = Math.min(video.duration || 0, video.currentTime + 10);
+      if (event.key === "ArrowLeft" && !compatibilityMode) video.currentTime = Math.max(0, video.currentTime - 10);
       if (event.key.toLowerCase() === "f") void toggleFullscreen();
     }
     window.addEventListener("keydown", keyboard);
@@ -331,20 +367,20 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   if (!stream) return <div className="player-shell player-empty"><Film size={25} /><p>{streams.length ? "This browser doesn't support the available video formats." : "No playable stream was returned for this title."}</p>{onRetry && <button className="button button-primary" onClick={onRetry}>Resolve again</button>}</div>;
 
   async function togglePlay() { const video = videoRef.current; const engine = engineRef.current; if (!video || !engine || !allowed) return; if (video.paused) { try { await engine.play(); } catch (cause: unknown) { if (import.meta.env.DEV) console.warn("[MovieBox playback] play blocked", cause); setError("Playback was blocked by the browser. Press play to try again."); } } else engine.pause(); }
-  function retryCurrentSource() { failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; setError(""); setBuffering(true); setSourceAttempt((attempt) => attempt + 1); }
+  function retryCurrentSource() { failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; compatibilityAttemptedFor.current = null; setCompatibilityMode(false); setError(""); setBuffering(true); setSourceAttempt((attempt) => attempt + 1); }
   async function toggleFullscreen() { const root = videoRef.current?.parentElement?.parentElement; if (!root) return; if (!document.fullscreenElement) { await root.requestFullscreen?.(); setFullscreen(true); } else { await document.exitFullscreen?.(); setFullscreen(false); } }
-  function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = playableStreams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); setStreamIndex(next); }
+  function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = playableStreams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; compatibilityAttemptedFor.current = null; setCompatibilityMode(false); resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); selectStream(next); }
   function signalActivity() { setShowControls(true); if (hideTimer.current) window.clearTimeout(hideTimer.current); if (playing) hideTimer.current = window.setTimeout(() => setShowControls(false), 2600); }
-  function handleTime(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setCurrentTime(video.currentTime); if (Math.abs(video.currentTime - saveRef.current) > 3 || video.currentTime === 0) { saveRef.current = video.currentTime; onProgress?.(video.currentTime, video.duration || duration); } }
-  function handleMetadata(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setDuration(video.duration || 0); setBuffering(false); if (!positionApplied && initialPosition > 0) { video.currentTime = Math.min(initialPosition, Math.max(0, (video.duration || initialPosition) - 4)); setPositionApplied(true); } if (allowed && resumeAfterLoadRef.current) { resumeAfterLoadRef.current = false; void engineRef.current?.play().catch(() => undefined); } }
-  function handleMediaError(event: React.SyntheticEvent<HTMLVideoElement>) { const mediaError = event.currentTarget.error; const diagnostics = { code: mediaError?.code, message: mediaError?.message, stream: stream.playback_url || stream.url }; if (import.meta.env.DEV) console.error("[MovieBox playback] media error", diagnostics); if ((mediaError?.code === 2 || mediaError?.code === 3 || mediaError?.code === 4) && advanceAfterFailure(streamIndex)) return; setBuffering(false); setError(playbackFailureMessage(mediaError?.code)); }
+  function handleTime(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; const total = Number.isFinite(video.duration) ? video.duration : duration; setCurrentTime(video.currentTime); if (Math.abs(video.currentTime - saveRef.current) > 3 || video.currentTime === 0) { saveRef.current = video.currentTime; onProgress?.(video.currentTime, total); } }
+  function handleMetadata(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setDuration(Number.isFinite(video.duration) ? video.duration : Number(stream.duration_sec || 0)); setBuffering(false); if (!compatibilityMode && !positionApplied && initialPosition > 0 && Number.isFinite(video.duration)) { video.currentTime = Math.min(initialPosition, Math.max(0, video.duration - 4)); setPositionApplied(true); } if (allowed && resumeAfterLoadRef.current) { resumeAfterLoadRef.current = false; void engineRef.current?.play().catch(() => undefined); } }
+  function handleMediaError(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; if (!video.currentSrc || video.currentSrc !== expectedMediaSourceRef.current) return; const mediaError = video.error; const diagnostics = { code: mediaError?.code, message: mediaError?.message, quality: stream.quality, codec: stream.codec, format: stream.format }; if (import.meta.env.DEV) console.error("[MovieBox playback] media error", diagnostics); recoverPlaybackFailure(streamIndex, mediaError?.code); }
   return <div className={`player-shell ${showControls ? "controls-visible" : "controls-hidden"}`} onMouseMove={signalActivity} onTouchStart={signalActivity}>
     <video ref={videoRef} playsInline preload="metadata" onClick={() => void togglePlay()} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onWaiting={() => setBuffering(true)} onCanPlay={() => setBuffering(false)} onLoadedMetadata={handleMetadata} onTimeUpdate={handleTime} onEnded={onEnded} onError={handleMediaError} onVolumeChange={(event) => { setVolume(event.currentTarget.volume); setMuted(event.currentTarget.muted); }} aria-label="MovieBox video player">{captionSrc && <track kind="subtitles" src={captionSrc} srcLang="en" label={captions.find((caption) => caption.url === selectedCaption)?.language || "Subtitles"} default />}</video>
     {!allowed && <div className="player-locked"><span><Play size={20} fill="currentColor" /></span><b>Playback is ready</b><small>Complete the short pre-play step to begin.</small></div>}
     {buffering && allowed && !error && <div className="player-buffer"><LoaderCircle className="spin" size={28} /></div>}
     {error && <div className="player-error"><strong>Playback paused</strong><p>{error}</p><div><button className="button button-primary" onClick={onRetry}>Resolve again</button><button className="button button-ghost" onClick={retryCurrentSource}>Reload source</button></div></div>}
-    <div className="player-topline"><span>{stream.quality || "Auto"}</span><span>{stream.format || "Stream"}</span></div>
-    <div className="player-controls"><input className="seekbar" type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} onChange={(event) => { const value = Number(event.target.value); if (videoRef.current) videoRef.current.currentTime = value; setCurrentTime(value); }} aria-label="Seek video" /><div className="control-row"><button className="player-button" onClick={() => void togglePlay()} aria-label={playing ? "Pause" : "Play"}>{playing ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}</button><button className="player-button" onClick={() => { if (videoRef.current) videoRef.current.currentTime -= 10; }} aria-label="Rewind 10 seconds"><RotateCcw size={17} /></button><span className="time-label">{formatTime(currentTime)} / {formatTime(duration)}</span><div className="control-spacer" /><label className="volume-control"><button className="player-button" onClick={() => { const nextMuted = !muted; setMuted(nextMuted); if (videoRef.current) videoRef.current.muted = nextMuted; }} aria-label={muted ? "Unmute" : "Mute"}>{muted ? <VolumeX size={18} /> : <Volume2 size={18} />}</button><input type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); setMuted(next === 0); if (videoRef.current) { videoRef.current.volume = next; videoRef.current.muted = next === 0; } }} aria-label="Volume" /></label><label className="player-select"><Gauge size={14} /><select value={speed} onChange={(event) => { const next = Number(event.target.value); setSpeed(next); if (videoRef.current) videoRef.current.playbackRate = next; }} aria-label="Playback speed"><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>{qualityOptions.length > 1 && <label className="player-select"><span>HD</span><select value={stream.quality} onChange={switchQuality} aria-label="Video quality">{qualityOptions.map((option) => <option value={option.quality} key={option.quality}>{option.quality}</option>)}</select></label>}{captions.length > 0 && <label className="player-select"><Subtitles size={14} /><select value={selectedCaption} onChange={(event) => setSelectedCaption(event.target.value)} aria-label="Subtitles"><option value="">Subtitles off</option>{captions.map((caption) => <option value={caption.url} key={caption.url}>{caption.language}</option>)}</select></label>}<button className="player-button" onClick={() => { const video = videoRef.current; if (video && "pictureInPictureEnabled" in document) void video.requestPictureInPicture?.(); }} aria-label="Picture in picture"><PictureInPicture size={18} /></button><button className="player-button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}><Expand size={19} /></button></div></div>
+    <div className="player-topline"><span>{stream.quality || "Auto"}</span><span>{compatibilityMode ? "Compatible MP4" : stream.format || "Stream"}</span></div>
+    <div className="player-controls"><input className="seekbar" type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} disabled={compatibilityMode || !duration} onChange={(event) => { const value = Number(event.target.value); if (videoRef.current) videoRef.current.currentTime = value; setCurrentTime(value); }} aria-label="Seek video" /><div className="control-row"><button className="player-button" onClick={() => void togglePlay()} aria-label={playing ? "Pause" : "Play"}>{playing ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}</button><button className="player-button" disabled={compatibilityMode} onClick={() => { if (videoRef.current) videoRef.current.currentTime -= 10; }} aria-label="Rewind 10 seconds"><RotateCcw size={17} /></button><span className="time-label">{formatTime(currentTime)} / {formatTime(duration)}</span><div className="control-spacer" /><label className="volume-control"><button className="player-button" onClick={() => { const nextMuted = !muted; setMuted(nextMuted); if (videoRef.current) videoRef.current.muted = nextMuted; }} aria-label={muted ? "Unmute" : "Mute"}>{muted ? <VolumeX size={18} /> : <Volume2 size={18} />}</button><input type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); setMuted(next === 0); if (videoRef.current) { videoRef.current.volume = next; videoRef.current.muted = next === 0; } }} aria-label="Volume" /></label><label className="player-select"><Gauge size={14} /><select value={speed} onChange={(event) => { const next = Number(event.target.value); setSpeed(next); if (videoRef.current) videoRef.current.playbackRate = next; }} aria-label="Playback speed"><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>{qualityOptions.length > 1 && <label className="player-select"><span>HD</span><select value={stream.quality} onChange={switchQuality} aria-label="Video quality">{qualityOptions.map((option) => <option value={option.quality} key={option.quality}>{option.quality}</option>)}</select></label>}{captions.length > 0 && <label className="player-select"><Subtitles size={14} /><select value={selectedCaption} onChange={(event) => setSelectedCaption(event.target.value)} aria-label="Subtitles"><option value="">Subtitles off</option>{captions.map((caption) => <option value={caption.url} key={caption.url}>{caption.language}</option>)}</select></label>}<button className="player-button" onClick={() => { const video = videoRef.current; if (video && "pictureInPictureEnabled" in document) void video.requestPictureInPicture?.(); }} aria-label="Picture in picture"><PictureInPicture size={18} /></button><button className="player-button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}><Expand size={19} /></button></div></div>
   </div>;
 }
 

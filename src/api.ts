@@ -88,6 +88,7 @@ function normalizeStream(raw: unknown): Stream {
     duration_sec: typeof value.duration_sec === "number" ? value.duration_sec : null,
     headers: asRecord(value.headers) as Record<string, string>,
     playback_url: asString(value.playback_url) || undefined,
+    compatibility_url: asString(value.compatibility_url) || undefined,
     is_dash: Boolean(value.is_dash),
     is_browser_playable: value.is_browser_playable !== false,
     requires_proxy: Boolean(value.requires_proxy),

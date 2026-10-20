@@ -28,6 +28,8 @@ This repository includes a Dockerfile and `render.yaml` for a single Render web 
 
 The app keeps streaming requests on the deployed service origin, so catalog, playback resolution, media proxying, subtitle, and audio/video track features do not depend on a second separately configured API host. Actual playable tracks and qualities depend on what the upstream source supplies for each title.
 
+The player tries the provider's original streams first. If a browser rejects every available source, the Docker service uses FFmpeg to retry as H.264/AAC MP4, capped at 720p for compatibility. This fallback is a sequential stream, so seeking and resume are unavailable while it is active. `COMPAT_TRANSCODE_LIMIT` controls the number of simultaneous fallback encodes (default `1`).
+
 ## Configuration
 
 `VITE_API_BASE_URL` is empty for the combined production service and can be set when deploying the frontend separately. `VITE_ENABLE_ADS` controls banner placements. `VITE_ENABLE_PREPLAY_AD` enables the click-to-open pre-play sponsor gate. `VITE_SMART_LINK_URL` sets that sponsor URL; it opens only after the viewer clicks **Watch ad**. `VITE_AD_COUNTDOWN_SECONDS` controls the unlock countdown. Optional banner URL, image, and label values customize ad placements. `PROXY_SIGNING_SECRET` and upstream credentials must remain server-side.
