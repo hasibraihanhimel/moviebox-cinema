@@ -144,7 +144,7 @@ export async function searchTitles(query: string, page = 1, signal?: AbortSignal
   const clean = query.trim();
   if (clean.length < 2) return { query: clean, page, results: [] };
   try {
-    const raw = await request<{ query?: string; page?: number; results?: unknown[] }>(`/search?q=${encodeURIComponent(clean)}&page=${page}&per_page=24`, { signal });
+    const raw = await request<{ query?: string; page?: number; results?: unknown[] }>(`/api/search?q=${encodeURIComponent(clean)}&page=${page}&per_page=24`, { signal });
     return { query: clean, page, results: normalizeList(raw.results) };
   } catch (error) {
     if (signal?.aborted) throw error;

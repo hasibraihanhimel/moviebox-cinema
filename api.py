@@ -793,7 +793,7 @@ def frontend_root():
         return FileResponse(index)
     raise HTTPException(status_code=404, detail="Frontend build not found")
 
-@app.get("/search")
+@app.get("/api/search")
 def search(q: str = Query(..., min_length=1, max_length=120), page: int = Query(1, ge=1, le=100), per_page: int = Query(20, ge=1, le=100)):
     try:
         results = engine.search(q, page=page, per_page=per_page)
