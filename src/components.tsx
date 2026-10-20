@@ -192,18 +192,29 @@ function subtitleSource(url: string, signal: AbortSignal): Promise<string> {
 function isHevcStream(stream: Stream): boolean {
   const codec = String(stream.codec || "").toLowerCase();
   const url = String(stream.url || "").toLowerCase();
-  return codec.includes("hevc") || codec.includes("h265") || url.includes("h265") || url.includes("hevc");
+  return /hevc|h\.?265|x265|hvc1|hev1/.test(codec) || /h265|hevc|hvc1|hev1/.test(url);
 }
 
 function browserCanPlayStream(stream: Stream): boolean {
   if (stream.is_browser_playable === false) return false;
   if (!isHevcStream(stream)) return true;
-  // DASH.js needs MSE support for HEVC, which is absent in many desktop browsers.
+  const profiles = ["hvc1", "hev1", "hvc1.1.6.L93.B0", "hev1.1.6.L93.B0"];
+  const isDash = stream.is_dash || stream.format?.toLowerCase() === "dash" || /\.mpd(?:$|[?#])/i.test(stream.url);
+  // DASH.js requires MSE support; progressive MP4 can also use the browser's
+  // native decoder, which may support HEVC even when MSE does not.
   const mediaSource = window.MediaSource;
-  if (!mediaSource || typeof mediaSource.isTypeSupported !== "function") return false;
-  return ["hvc1", "hev1", "hvc1.1.6.L93.B0", "hev1.1.6.L93.B0"].some((profile) =>
-    mediaSource.isTypeSupported(`video/mp4; codecs="${profile}"`),
-  );
+  const mseSupported = Boolean(mediaSource && typeof mediaSource.isTypeSupported === "function" && profiles.some((profile) => mediaSource.isTypeSupported(`video/mp4; codecs="${profile}"`)));
+  if (isDash) return mseSupported;
+  const video = document.createElement("video");
+  return mseSupported || profiles.some((profile) => video.canPlayType(`video/mp4; codecs="${profile}"`) !== "");
+}
+
+function playbackFailureMessage(code?: number): string {
+  if (code === 1) return "Playback was interrupted. Reload the source or resolve it again.";
+  if (code === 2) return "The video connection was interrupted. Resolve the stream to try another source.";
+  if (code === 3) return "This video could not be decoded by the browser. Choose another quality or resolve the stream.";
+  if (code === 4) return "This video format is not supported by the browser. Choose another quality or resolve the stream.";
+  return "The selected stream could not be loaded. Reload it or resolve another source.";
 }
 
 export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, onProgress, onRetry, onEnded }: { streams: Stream[]; captions: Subtitle[]; allowed: boolean; initialPosition?: number; onProgress?: (position: number, duration: number) => void; onRetry?: () => void; onEnded?: () => void }) {
@@ -225,6 +236,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   const [captionSrc, setCaptionSrc] = useState("");
   const [fullscreen, setFullscreen] = useState(false);
   const [positionApplied, setPositionApplied] = useState(false);
+  const [sourceAttempt, setSourceAttempt] = useState(0);
   const hideTimer = useRef<number | undefined>(undefined);
   const failedStreamIndices = useRef(new Set<number>());
   const lastAutoFallbackFrom = useRef<number | null>(null);
@@ -289,11 +301,11 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     engineRef.current = engine;
     engine.load(stream, startAt).then(() => {
       if (active) setBuffering(false);
-    }).catch((cause: unknown) => {
-      if (active && !advanceAfterFailure(streamIndex)) { setBuffering(false); setError(cause instanceof Error ? cause.message : "Media metadata could not be loaded."); }
+    }).catch(() => {
+      if (active && !advanceAfterFailure(streamIndex)) { setBuffering(false); setError(playbackFailureMessage(video.error?.code)); }
     });
     return () => { active = false; engine.destroy(); if (engineRef.current === engine) engineRef.current = null; if (shouldResume) resumeAfterLoadRef.current = true; };
-  }, [stream?.playback_url, stream?.url]);
+  }, [stream?.playback_url, stream?.url, sourceAttempt]);
   useEffect(() => {
     if (!selectedCaption) { setCaptionSrc(""); return; }
     const controller = new AbortController();
@@ -319,17 +331,18 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   if (!stream) return <div className="player-shell player-empty"><Film size={25} /><p>{streams.length ? "This browser doesn't support the available video formats." : "No playable stream was returned for this title."}</p>{onRetry && <button className="button button-primary" onClick={onRetry}>Resolve again</button>}</div>;
 
   async function togglePlay() { const video = videoRef.current; const engine = engineRef.current; if (!video || !engine || !allowed) return; if (video.paused) { try { await engine.play(); } catch (cause: unknown) { if (import.meta.env.DEV) console.warn("[MovieBox playback] play blocked", cause); setError("Playback was blocked by the browser. Press play to try again."); } } else engine.pause(); }
+  function retryCurrentSource() { failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; setError(""); setBuffering(true); setSourceAttempt((attempt) => attempt + 1); }
   async function toggleFullscreen() { const root = videoRef.current?.parentElement?.parentElement; if (!root) return; if (!document.fullscreenElement) { await root.requestFullscreen?.(); setFullscreen(true); } else { await document.exitFullscreen?.(); setFullscreen(false); } }
   function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = playableStreams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); setStreamIndex(next); }
   function signalActivity() { setShowControls(true); if (hideTimer.current) window.clearTimeout(hideTimer.current); if (playing) hideTimer.current = window.setTimeout(() => setShowControls(false), 2600); }
   function handleTime(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setCurrentTime(video.currentTime); if (Math.abs(video.currentTime - saveRef.current) > 3 || video.currentTime === 0) { saveRef.current = video.currentTime; onProgress?.(video.currentTime, video.duration || duration); } }
   function handleMetadata(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setDuration(video.duration || 0); setBuffering(false); if (!positionApplied && initialPosition > 0) { video.currentTime = Math.min(initialPosition, Math.max(0, (video.duration || initialPosition) - 4)); setPositionApplied(true); } if (allowed && resumeAfterLoadRef.current) { resumeAfterLoadRef.current = false; void engineRef.current?.play().catch(() => undefined); } }
-  function handleMediaError(event: React.SyntheticEvent<HTMLVideoElement>) { const mediaError = event.currentTarget.error; const diagnostics = { code: mediaError?.code, message: mediaError?.message, stream: stream.playback_url || stream.url }; if (import.meta.env.DEV) console.error("[MovieBox playback] media error", diagnostics); if ((mediaError?.code === 2 || mediaError?.code === 3 || mediaError?.code === 4) && advanceAfterFailure(streamIndex)) return; const message = mediaError?.code === 1 ? "Playback was interrupted." : mediaError?.code === 2 ? "The video connection was interrupted." : mediaError?.code === 3 ? "This video could not be decoded by the browser." : mediaError?.code === 4 ? "The video source is unavailable." : "The video source could not be loaded."; setBuffering(false); setError(message); }
+  function handleMediaError(event: React.SyntheticEvent<HTMLVideoElement>) { const mediaError = event.currentTarget.error; const diagnostics = { code: mediaError?.code, message: mediaError?.message, stream: stream.playback_url || stream.url }; if (import.meta.env.DEV) console.error("[MovieBox playback] media error", diagnostics); if ((mediaError?.code === 2 || mediaError?.code === 3 || mediaError?.code === 4) && advanceAfterFailure(streamIndex)) return; setBuffering(false); setError(playbackFailureMessage(mediaError?.code)); }
   return <div className={`player-shell ${showControls ? "controls-visible" : "controls-hidden"}`} onMouseMove={signalActivity} onTouchStart={signalActivity}>
     <video ref={videoRef} playsInline preload="metadata" onClick={() => void togglePlay()} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onWaiting={() => setBuffering(true)} onCanPlay={() => setBuffering(false)} onLoadedMetadata={handleMetadata} onTimeUpdate={handleTime} onEnded={onEnded} onError={handleMediaError} onVolumeChange={(event) => { setVolume(event.currentTarget.volume); setMuted(event.currentTarget.muted); }} aria-label="MovieBox video player">{captionSrc && <track kind="subtitles" src={captionSrc} srcLang="en" label={captions.find((caption) => caption.url === selectedCaption)?.language || "Subtitles"} default />}</video>
     {!allowed && <div className="player-locked"><span><Play size={20} fill="currentColor" /></span><b>Playback is ready</b><small>Complete the short pre-play step to begin.</small></div>}
     {buffering && allowed && !error && <div className="player-buffer"><LoaderCircle className="spin" size={28} /></div>}
-    {error && <div className="player-error"><strong>Playback paused</strong><p>{error}</p><div><button className="button button-primary" onClick={onRetry}>Resolve again</button><button className="button button-ghost" onClick={() => { setError(""); void togglePlay(); }}>Try again</button></div></div>}
+    {error && <div className="player-error"><strong>Playback paused</strong><p>{error}</p><div><button className="button button-primary" onClick={onRetry}>Resolve again</button><button className="button button-ghost" onClick={retryCurrentSource}>Reload source</button></div></div>}
     <div className="player-topline"><span>{stream.quality || "Auto"}</span><span>{stream.format || "Stream"}</span></div>
     <div className="player-controls"><input className="seekbar" type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} onChange={(event) => { const value = Number(event.target.value); if (videoRef.current) videoRef.current.currentTime = value; setCurrentTime(value); }} aria-label="Seek video" /><div className="control-row"><button className="player-button" onClick={() => void togglePlay()} aria-label={playing ? "Pause" : "Play"}>{playing ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}</button><button className="player-button" onClick={() => { if (videoRef.current) videoRef.current.currentTime -= 10; }} aria-label="Rewind 10 seconds"><RotateCcw size={17} /></button><span className="time-label">{formatTime(currentTime)} / {formatTime(duration)}</span><div className="control-spacer" /><label className="volume-control"><button className="player-button" onClick={() => { const nextMuted = !muted; setMuted(nextMuted); if (videoRef.current) videoRef.current.muted = nextMuted; }} aria-label={muted ? "Unmute" : "Mute"}>{muted ? <VolumeX size={18} /> : <Volume2 size={18} />}</button><input type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); setMuted(next === 0); if (videoRef.current) { videoRef.current.volume = next; videoRef.current.muted = next === 0; } }} aria-label="Volume" /></label><label className="player-select"><Gauge size={14} /><select value={speed} onChange={(event) => { const next = Number(event.target.value); setSpeed(next); if (videoRef.current) videoRef.current.playbackRate = next; }} aria-label="Playback speed"><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>{qualityOptions.length > 1 && <label className="player-select"><span>HD</span><select value={stream.quality} onChange={switchQuality} aria-label="Video quality">{qualityOptions.map((option) => <option value={option.quality} key={option.quality}>{option.quality}</option>)}</select></label>}{captions.length > 0 && <label className="player-select"><Subtitles size={14} /><select value={selectedCaption} onChange={(event) => setSelectedCaption(event.target.value)} aria-label="Subtitles"><option value="">Subtitles off</option>{captions.map((caption) => <option value={caption.url} key={caption.url}>{caption.language}</option>)}</select></label>}<button className="player-button" onClick={() => { const video = videoRef.current; if (video && "pictureInPictureEnabled" in document) void video.requestPictureInPicture?.(); }} aria-label="Picture in picture"><PictureInPicture size={18} /></button><button className="player-button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}><Expand size={19} /></button></div></div>
   </div>;

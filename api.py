@@ -303,11 +303,11 @@ def _normalize_stream(stream: Dict[str, Any]) -> Dict[str, Any]:
     raw_codec = str(stream.get("codec") or "").lower()
     if not raw_codec or raw_codec == "unknown":
         path = url.lower()
-        raw_codec = "hevc" if any(value in path for value in ("h265", "hevc")) else "h264" if any(value in path for value in ("h264", "avc")) else ""
+        raw_codec = "hevc" if any(value in path for value in ("h265", "h.265", "hevc", "hvc1", "hev1", "x265")) else "h264" if any(value in path for value in ("h264", "avc")) else ""
     is_dash = raw_format in {"dash", "mpd", "application/dash+xml"} or ".mpd" in url.lower()
     is_mp4 = raw_format in {"mp4", "video/mp4", "application/mp4"} or ".mp4" in url.lower()
     has_h264 = any(value in raw_codec for value in ("h264", "avc"))
-    has_hevc = any(value in raw_codec for value in ("hevc", "h265", "x265"))
+    has_hevc = any(value in raw_codec for value in ("hevc", "h265", "h.265", "x265", "hvc1", "hev1"))
     codec = "unknown" if has_h264 and has_hevc else "h264" if has_h264 else "hevc" if has_hevc else (raw_codec or "unknown")
     requires_headers = bool(stream.get("headers") or stream.get("cookie"))
     stream["format"] = "DASH" if is_dash else "MP4" if is_mp4 else (stream.get("format") or "unknown")
