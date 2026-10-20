@@ -162,8 +162,10 @@ export async function getSuggestions(query: string, signal?: AbortSignal): Promi
   return Array.isArray(raw.suggestions) ? raw.suggestions.filter((item) => item && typeof item.title === "string").map((item) => ({ ...item, subject_id: item.subject_id && !/^(?:none|null|undefined)$/i.test(item.subject_id) ? item.subject_id : null })) : [];
 }
 
-export async function getDetail(id: string): Promise<DetailResponse> {
-  const raw = await request<DetailResponse>(`/detail/${encodeURIComponent(validId(id))}`, {}, 120_000);
+export async function getDetail(id: string, detailPath?: string): Promise<DetailResponse> {
+  const params = new URLSearchParams();
+  if (detailPath) params.set("detail_path", detailPath.slice(0, 180));
+  const raw = await request<DetailResponse>(`/detail/${encodeURIComponent(validId(id))}${params.size ? `?${params}` : ""}`, {}, 120_000);
   return { ...raw, subject_id: asString(raw.subject_id || id), title: asString(raw.title, "Untitled"), type: raw.type === "Series" ? "Series" : "Movie" };
 }
 

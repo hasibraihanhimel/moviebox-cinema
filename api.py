@@ -110,11 +110,11 @@ BOOTSTRAP_HOST = "https://apig.inmoviebox.com"
 BOOTSTRAP_URL = f"{BOOTSTRAP_HOST}/wefeed-mobile-bff/tab/ranking-list?tabId=0&categoryType=4516404531735022304&page=1&perPage=1"
 
 WEB_DOMAINS = [
+    "https://h5-api.aoneroom.com",
     "https://123moviesfree.club",
     "https://movie-box.co",
     "https://movieboxonline.net",
     "https://sflix.film",
-    "https://h5-api.aoneroom.com",
     "https://netnaija.film",
     "https://movieboxhd.net",
 ]
@@ -331,6 +331,29 @@ def _search_items(data: Any) -> List[Dict[str, Any]]:
         current = nested
     return []
 
+
+def _upstream_data(response: Any) -> Any:
+    """Unwrap the common H5 BFF response envelope without assuming a fixed depth."""
+    current = response
+    for _ in range(4):
+        if not isinstance(current, dict) or "data" not in current:
+            break
+        current = current["data"]
+    return current
+
+
+def _cover_url(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        return value.get("url") or value.get("coverUrl") or value.get("path")
+    return value if isinstance(value, str) else None
+
+
+def _subject_type(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 class MovieBoxEngine:
     _instance = None
 
@@ -355,6 +378,14 @@ class MovieBoxEngine:
         resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=20)
         x_user = resp.headers.get("x-user")
         if not x_user:
+            # Render regions can be blocked by the native bootstrap host even
+            # while the public H5 service remains available.
+            try:
+                self.h5_request("GET", "/home", params={"host": "moviebox.ph"})
+            except Exception:
+                pass
+            if self.bearer_token:
+                return self.bearer_token
             raise HTTPException(status_code=502, detail="Failed to bootstrap MovieBox token")
         token_data = json.loads(x_user)
         token = token_data.get("token")
@@ -390,7 +421,48 @@ class MovieBoxEngine:
             raise HTTPException(status_code=502, detail=f"API returned HTTP {resp.status_code}")
         return resp.json()
 
+    def h5_request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Any:
+        """Call the public web BFF, which is reachable on Render without mobile bootstrap."""
+        url = f"{API_BASE}/{path.lstrip('/')}"
+        headers = {
+            "User-Agent": WEB_USER_AGENT,
+            "Referer": "https://moviebox.ph/",
+            "Origin": "https://moviebox.ph",
+            "Accept": "application/json, text/plain, */*",
+            "x-request-lang": "en",
+            "x-source": "moviebox",
+        }
+        if method.upper() == "POST":
+            response = self.session.post(url, params=params, headers=headers, json=body or {}, timeout=20)
+        else:
+            response = self.session.get(url, params=params, headers=headers, timeout=20)
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Web catalog returned HTTP {response.status_code}")
+        x_user = response.headers.get("x-user")
+        if x_user:
+            try:
+                token_data = json.loads(x_user)
+                token = token_data.get("token") if isinstance(token_data, dict) else None
+                if token:
+                    self.bearer_token = str(token)
+            except (TypeError, json.JSONDecodeError):
+                logger.debug("Ignoring malformed H5 guest token header")
+        return response.json()
+
     def search(self, query: str, page: int = 1, per_page: int = 20) -> List[Dict[str, Any]]:
+        # The H5 search route is the same route used by the website and does not
+        # require the mobile guest token that is blocked from some Render regions.
+        for payload in (
+            {"keyword": query, "page": page, "perPage": per_page, "subjectType": 5},
+            {"keyword": query, "page": page, "perPage": per_page},
+        ):
+            try:
+                response = self.h5_request("POST", "/subject/search", body=payload)
+                data = _search_items(_upstream_data(response))
+                if data:
+                    return self._map_subjects(data)
+            except Exception as exc:
+                logger.info("H5 search variant unavailable, trying next: %s", exc)
         # The upstream recently changed the accepted pagination fields. Try
         # the current contract first and keep the prior contract as fallback.
         variants = [
@@ -420,6 +492,10 @@ class MovieBoxEngine:
             data = first_empty_data
         if data is None:
             raise last_error or HTTPException(status_code=502, detail="Search is unavailable")
+        return self._map_subjects(data)
+
+    @staticmethod
+    def _map_subjects(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         results = []
         for item in data:
             if not isinstance(item, dict):
@@ -432,18 +508,49 @@ class MovieBoxEngine:
             results.append({
                 "subject_id": str(subject_id),
                 "title": title,
-                "type": "Series" if sub.get("subjectType", sub.get("subject_type")) == 2 else "Movie",
-                "subject_type": sub.get("subjectType", sub.get("subject_type")),
+                "type": "Series" if _subject_type(sub.get("subjectType", sub.get("subject_type"))) == 2 else "Movie",
+                "subject_type": _subject_type(sub.get("subjectType", sub.get("subject_type"))),
                 "release_date": sub.get("releaseDate") or sub.get("release_date"),
                 "imdb_rating": sub.get("imdbRatingValue") or sub.get("imdb_rating"),
                 "genre": sub.get("genre"),
-                "cover": sub.get("cover", {}).get("url") if isinstance(sub.get("cover"), dict) else None,
-                "detail_path": sub.get("detailPath") or sub.get("detail_path"),
+                "cover": _cover_url(sub.get("cover") or sub.get("poster")),
+                "backdrop": _cover_url(sub.get("backdrop") or sub.get("background")),
+                "detail_path": sub.get("detailPath") or sub.get("detail_path") or sub.get("slug"),
+                "description": sub.get("description") or sub.get("plot"),
                 "language": sub.get("language")
             })
         return results
 
-    def get_details(self, subject_id: str) -> Dict[str, Any]:
+    def get_details(self, subject_id: str, detail_path: Optional[str] = None) -> Dict[str, Any]:
+        if detail_path:
+            try:
+                response = self.h5_request("GET", "/detail", params={"detailPath": detail_path, "host": "moviebox.ph"})
+                data = _upstream_data(response)
+                subject = data.get("subject") if isinstance(data, dict) and isinstance(data.get("subject"), dict) else data
+                if isinstance(subject, dict) and (subject.get("subjectId") or subject.get("subject_id") or subject.get("id")):
+                    return self._map_detail(subject, subject_id, detail_path)
+            except Exception as exc:
+                logger.info("H5 detail by path failed for %s: %s", subject_id, exc)
+        # Resolve the slug from the working home feed when older direct links do
+        # not carry it, then fetch the H5 detail instead of relying on mobile auth.
+        try:
+            home = _upstream_data(self.h5_request("GET", "/home", params={"host": "moviebox.ph"}))
+            for section in home.get("operatingList", []) if isinstance(home, dict) else []:
+                candidates = (section.get("subjects") or []) if isinstance(section, dict) else []
+                banner = section.get("banner", {}) if isinstance(section, dict) else {}
+                candidates = list(candidates) + (banner.get("items", []) if isinstance(banner, dict) and isinstance(banner.get("items"), list) else [])
+                for candidate in candidates:
+                    sub = candidate.get("subject") if isinstance(candidate.get("subject"), dict) else candidate
+                    if str(sub.get("subjectId") or sub.get("subject_id") or sub.get("id") or "") == subject_id:
+                        slug = sub.get("detailPath") or sub.get("detail_path") or sub.get("slug")
+                        if slug:
+                            response = self.h5_request("GET", "/detail", params={"detailPath": slug, "host": "moviebox.ph"})
+                            data = _upstream_data(response)
+                            detail = data.get("subject") if isinstance(data, dict) and isinstance(data.get("subject"), dict) else data
+                            if isinstance(detail, dict) and (detail.get("title") or detail.get("name")):
+                                return self._map_detail(detail, subject_id, slug)
+        except Exception as exc:
+            logger.info("H5 detail lookup failed for %s: %s", subject_id, exc)
         url = f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}"
         data = self.api_request("GET", url).get("data", {})
         detail_url_str = data.get("detailUrl", "")
@@ -473,6 +580,34 @@ class MovieBoxEngine:
             ]
         }
 
+    @staticmethod
+    def _map_detail(data: Dict[str, Any], subject_id: str, detail_path: Optional[str] = None) -> Dict[str, Any]:
+        subject_id = str(data.get("subjectId") or data.get("subject_id") or data.get("id") or subject_id)
+        subject_type = _subject_type(data.get("subjectType", data.get("subject_type")))
+        dubs = data.get("dubs") or data.get("resourceDetectors") or []
+        return {
+            "subject_id": subject_id,
+            "title": data.get("title") or data.get("name") or "Untitled",
+            "subject_type": subject_type,
+            "type": "Series" if subject_type == 2 else "Movie",
+            "description": data.get("description") or data.get("plot"),
+            "release_date": data.get("releaseDate") or data.get("release_date"),
+            "duration": data.get("duration"),
+            "imdb_rating": data.get("imdbRatingValue") or data.get("imdb_rating"),
+            "genre": data.get("genre"),
+            "country": data.get("countryName") or data.get("country"),
+            "language": data.get("language"),
+            "cover": _cover_url(data.get("cover") or data.get("poster")),
+            "backdrop": _cover_url(data.get("backdrop") or data.get("background")),
+            "detail_path": data.get("detailPath") or data.get("detail_path") or detail_path,
+            "dubs": [
+                {"subject_id": str(d.get("subjectId") or d.get("subject_id") or ""),
+                 "lang_name": d.get("lanName") or d.get("name"),
+                 "language": d.get("language")}
+                for d in dubs if isinstance(d, dict)
+            ],
+        }
+
     def get_episodes(self, subject_id: str) -> List[Dict[str, Any]]:
         url = f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}"
         res = self.api_request("GET", url)
@@ -493,7 +628,14 @@ class MovieBoxEngine:
                 detail_path = details.get("detail_path", "")
             except Exception:
                 detail_path = ""
-        token = self.bootstrap_token()
+        token = None
+        # A guest bearer improves compatibility on some mirrors, but the H5
+        # API often accepts playback requests without it. Do not fail playback
+        # before trying those reachable web endpoints when bootstrap is blocked.
+        try:
+            token = self.bootstrap_token()
+        except Exception as exc:
+            logger.info("Mobile token bootstrap unavailable; trying public playback providers: %s", exc)
         streams: List[Dict[str, Any]] = []
         seen_urls = set()
 
@@ -513,8 +655,9 @@ class MovieBoxEngine:
                 "x-vip-restrict": "0",
                 "x-no-high-risk-restrict": "0",
                 "x-source": "moviebox",
-                "Authorization": f"Bearer {token}",
             }
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             try:
                 resp = self.session.get(play_url, headers=headers, timeout=12)
                 if resp.status_code != 200:
@@ -579,11 +722,15 @@ class MovieBoxEngine:
                                     "Origin": domain,
                                 }
                             })
+                    if streams:
+                        break
             except Exception:
                 logger.warning("web provider stream probe failed", extra={"provider": domain, "subject_id": subject_id}, exc_info=True)
 
         try:
             native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
+            if not token:
+                raise HTTPException(status_code=502, detail="Mobile playback token unavailable")
             native_data = self.api_request("GET", native_url).get("data", {})
             for st in native_data.get("streams", []):
                 raw_url = st.get("url")
@@ -795,27 +942,7 @@ def frontend_root():
 
 @app.get("/api/search")
 def search(q: str = Query(..., min_length=1, max_length=120), page: int = Query(1, ge=1, le=100), per_page: int = Query(20, ge=1, le=100)):
-    try:
-        results = engine.search(q, page=page, per_page=per_page)
-    except HTTPException:
-        results = []
-    # A successful but empty response can also mean that the provider accepted
-    # an obsolete search contract. Autocomplete remains a useful first-page
-    # fallback in that case.
-    if not results and page == 1:
-        suggestions = search_suggest(q).get("suggestions", [])
-        results = [
-            {
-                "subject_id": item["subject_id"],
-                "title": item["title"],
-                "type": item.get("type", "Movie"),
-                "subject_type": 2 if item.get("type") == "Series" else 1,
-                "detail_path": item.get("slug"),
-            }
-            for item in suggestions
-            if item.get("title") and item.get("subject_id")
-            and str(item.get("subject_id")).lower() not in {"none", "null", "undefined"}
-        ]
+    results = engine.search(q, page=page, per_page=per_page)
     return {"query": q, "page": page, "results": results}
 
 @app.get("/search/suggest")
@@ -842,8 +969,10 @@ def search_suggest(q: str = Query(..., min_length=1, max_length=120)):
     return {"suggestions": [item for item in suggestions if item.get("title")]}
 
 @app.get("/detail/{subject_id}")
-def get_detail(subject_id: str):
-    return engine.get_details(validate_subject_id(subject_id))
+def get_detail(subject_id: str, detail_path: Optional[str] = Query(None, max_length=180)):
+    if detail_path and (".." in detail_path or "\x00" in detail_path):
+        raise HTTPException(status_code=400, detail="Invalid title path")
+    return engine.get_details(validate_subject_id(subject_id), detail_path=detail_path)
 
 @app.get("/episodes/{subject_id}")
 def get_episodes(subject_id: str):
@@ -875,18 +1004,41 @@ def get_captions(subject_id: str, se: int = Query(0, ge=0, le=100), ep: int = Qu
     }
 
 def _get_ranked_catalog(tab_id: int, page: int, per_page: int, expected_type: int) -> Dict[str, Any]:
-    """Read the correctly categorized MovieBox tab instead of its stale generic filter feed."""
-    query = urlencode({"tabId": tab_id, "categoryType": tab_id, "page": page, "perPage": per_page})
-    response = engine.api_request("GET", f"/wefeed-mobile-bff/tab/ranking-list?{query}", use_token=False)
-    data = response.get("data", {}) if isinstance(response, dict) else {}
-    pager = data.get("pager", {}) if isinstance(data, dict) else {}
-    raw_items = data.get("subjects") or data.get("items") or data.get("list") or []
+    """Read the mobile ranking feed, falling back to reachable H5 home shelves."""
+    pager: Dict[str, Any] = {}
+    raw_items: List[Dict[str, Any]] = []
+    try:
+        query = urlencode({"tabId": tab_id, "categoryType": tab_id, "page": page, "perPage": per_page})
+        response = engine.api_request("GET", f"/wefeed-mobile-bff/tab/ranking-list?{query}", use_token=False)
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        pager = data.get("pager", {}) if isinstance(data, dict) else {}
+        raw_items = data.get("subjects") or data.get("items") or data.get("list") or []
+    except Exception as exc:
+        logger.info("Mobile catalog unavailable; using H5 home shelves: %s", exc)
+    if not raw_items:
+        home = _upstream_data(engine.h5_request("GET", "/home", params={"host": "moviebox.ph"}))
+        for section in home.get("operatingList", []) if isinstance(home, dict) else []:
+            if not isinstance(section, dict):
+                continue
+            candidates = section.get("subjects") or []
+            banner = section.get("banner")
+            if isinstance(banner, dict) and isinstance(banner.get("items"), list):
+                candidates = list(candidates) + banner["items"]
+            if isinstance(candidates, list):
+                section_type = 2 if any(word in str(section.get("title") or "").lower() for word in ("series", "tv show", "drama")) else 1
+                for candidate in candidates:
+                    if isinstance(candidate, dict):
+                        subject = candidate.get("subject") if isinstance(candidate.get("subject"), dict) else candidate
+                        if not subject.get("subjectType") and not subject.get("subject_type"):
+                            subject["subjectType"] = section_type
+                    raw_items.append(candidate)
     items = []
     for item in raw_items:
         if not isinstance(item, dict):
             continue
         subject = item.get("subject") if isinstance(item.get("subject"), dict) else item
-        if subject.get("subjectType") != expected_type:
+        subject_type = _subject_type(subject.get("subjectType", subject.get("subject_type")))
+        if subject_type != expected_type:
             continue
         subject_id = subject.get("subjectId") or subject.get("subject_id") or subject.get("id")
         title = subject.get("title") or subject.get("name")
@@ -899,11 +1051,24 @@ def _get_ranked_catalog(tab_id: int, page: int, per_page: int, expected_type: in
             "type": "Series" if expected_type == 2 else "Movie",
             "subject_type": expected_type,
             "detail_path": subject.get("detailPath") or subject.get("detail_path"),
-            "cover": cover.get("url") if isinstance(cover, dict) else cover,
+            "cover": _cover_url(cover or subject.get("poster")),
+            "backdrop": _cover_url(subject.get("backdrop") or subject.get("background")),
             "rating": subject.get("imdbRatingValue") or subject.get("rating"),
             "year": str(subject.get("releaseDate") or subject.get("year") or "")[:4] or None,
             "genre": subject.get("genre"),
         })
+    # Home shelves are bounded and often overlap; deduplicate before paginating.
+    deduped = []
+    seen_ids = set()
+    for item in items:
+        if item["subject_id"] not in seen_ids:
+            seen_ids.add(item["subject_id"])
+            deduped.append(item)
+    items = deduped
+    if not pager:
+        start = (page - 1) * per_page
+        total = len(items)
+        return {"page": page, "per_page": per_page, "total": total, "items": items[start:start + per_page]}
     has_more = bool(pager.get("hasMore")) if isinstance(pager, dict) else False
     reported_total = int(pager.get("totalCount") or 0) if isinstance(pager, dict) else 0
     total = reported_total or (page * per_page + 1 if has_more else (page - 1) * per_page + len(items))
@@ -919,9 +1084,7 @@ def get_tv_series(page: int = Query(1, ge=1, le=100), per_page: int = Query(24, 
 
 @app.get("/home")
 def get_home():
-    url = f"{API_BASE}/home?host=moviebox.ph"
-    resp = engine.session.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
-    return resp.json()
+    return engine.h5_request("GET", "/home", params={"host": "moviebox.ph"})
 
 @app.get("/{frontend_path:path}", include_in_schema=False)
 def frontend_fallback(frontend_path: str):

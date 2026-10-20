@@ -67,6 +67,7 @@ main { min-height: calc(100vh - 150px); }
 .text-link:hover { color: var(--lime); }
 .movie-row { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(140px, 1fr); grid-template-rows: 1fr; gap: 14px; overflow: hidden; }
 .movie-card { min-width: 0; display: block; transition: transform .2s; }
+.movie-card:only-child { max-width: 180px; }
 .movie-card:hover { transform: translateY(-5px); }
 .card-art { aspect-ratio: 2 / 3; position: relative; overflow: hidden; border-radius: 8px; background: var(--surface-2); }
 .card-art::after { content: ""; position: absolute; inset: 0; background: linear-gradient(transparent 55%, rgba(0,0,0,.5)); opacity: 0; transition: .2s; }

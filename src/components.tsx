@@ -36,7 +36,8 @@ export function getGenres(item: MediaItem): string {
 }
 
 export function getMediaPath(item: MediaItem): string {
-  return item.type === "Series" ? `/series/${encodeURIComponent(item.subject_id)}` : `/movie/${encodeURIComponent(item.subject_id)}`;
+  const path = item.type === "Series" ? `/series/${encodeURIComponent(item.subject_id)}` : `/movie/${encodeURIComponent(item.subject_id)}`;
+  return item.detail_path ? `${path}?detail_path=${encodeURIComponent(item.detail_path)}` : path;
 }
 
 export function getWatchPath(item: MediaItem, season?: number, episode?: number): string {
@@ -44,6 +45,7 @@ export function getWatchPath(item: MediaItem, season?: number, episode?: number)
   const params = new URLSearchParams();
   if (season) params.set("season", String(season));
   if (episode) params.set("episode", String(episode));
+  if (item.detail_path) params.set("detail_path", item.detail_path);
   return params.size ? `${path}?${params}` : path;
 }
 

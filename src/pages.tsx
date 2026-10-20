@@ -59,7 +59,6 @@ function HomePage() {
       setSections([...movieSections, ...seriesSections]);
       setCatalogMovies(movies.items); setCatalogSeries(series.items);
       if (homeResult.status === "rejected" && !movies.items.length && !series.items.length) throw homeResult.reason;
-      if (moviesResult.status === "rejected" && seriesResult.status === "rejected") throw moviesResult.reason;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "We couldn't load the catalog.");
     } finally { setLoading(false); }
@@ -114,6 +113,8 @@ function episodeFor(seasons: Season[], season: number, episode: number): Episode
 
 function DetailsPage({ expectedType }: { expectedType: "Movie" | "Series" }) {
   const { id = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  const detailPath = searchParams.get("detail_path") || undefined;
   const navigate = useNavigate();
   const [detail, setDetail] = useState<DetailResponse | null>(null);
   const [episodes, setEpisodes] = useState<EpisodesResponse | null>(null);
@@ -123,9 +124,9 @@ function DetailsPage({ expectedType }: { expectedType: "Movie" | "Series" }) {
   const [season, setSeason] = useState(1);
   useEffect(() => {
     let active = true; setLoading(true); setError("");
-    Promise.all([getDetail(id), expectedType === "Series" ? getEpisodes(id) : Promise.resolve(null), getCatalog(expectedType === "Series" ? "tv-series" : "movies")]).then(([nextDetail, nextEpisodes, catalog]) => { if (!active) return; setDetail(nextDetail); setEpisodes(nextEpisodes); if (nextEpisodes?.seasons?.length) setSeason(nextEpisodes.seasons[0].season); setRelated(catalog.items.filter((item) => item.subject_id !== id).slice(0, 8)); }).catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : "We couldn't load this title."); }).finally(() => { if (active) setLoading(false); });
+    Promise.all([getDetail(id, detailPath), expectedType === "Series" ? getEpisodes(id).catch(() => null) : Promise.resolve(null), getCatalog(expectedType === "Series" ? "tv-series" : "movies").catch(() => ({ items: [] as MediaItem[], page: 1, per_page: 24, total: 0 }))]).then(([nextDetail, nextEpisodes, catalog]) => { if (!active) return; setDetail(nextDetail); setEpisodes(nextEpisodes); if (nextEpisodes?.seasons?.length) setSeason(nextEpisodes.seasons[0].season); setRelated(catalog.items.filter((item) => item.subject_id !== id).slice(0, 8)); }).catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : "We couldn't load this title."); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [id, expectedType]);
+  }, [id, expectedType, detailPath]);
   useEffect(() => { if (detail) setMeta(`${detail.title} · MovieBox Cinema`, valueOr(detail.description, `Watch ${detail.title} on MovieBox Cinema.`), detail.cover); }, [detail]);
   if (loading) return <Shell><div className="page-wrap detail-page"><div className="detail-loading shimmer" /><LoadingGrid count={5} /></div></Shell>;
   if (error || !detail) return <Shell><div className="page-wrap"><ErrorState message={error || "This title is not available."} onRetry={() => window.location.reload()} /></div></Shell>;
@@ -140,6 +141,7 @@ function DetailsPage({ expectedType }: { expectedType: "Movie" | "Series" }) {
 function WatchPage() {
   const { id = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
+  const detailPath = searchParams.get("detail_path") || undefined;
   const navigate = useNavigate();
   const requestedSeason = Number(searchParams.get("season") || 0);
   const requestedEpisode = Number(searchParams.get("episode") || 0);
@@ -165,17 +167,17 @@ function WatchPage() {
     if (audioSwitchRef.current) audioSwitchRef.current = false;
     else setAllowed(!adConfig.preplayEnabled);
     async function resolvePlayback() {
-      const nextDetail = await getDetail(id);
+      const nextDetail = await getDetail(id, detailPath);
       const series = nextDetail.type === "Series";
       const nextEpisodes = series ? await getEpisodes(id).catch(() => null) : null;
       const availableSeasons = nextEpisodes?.seasons || [];
       const selectedSeason = series ? (availableSeasons.find((item) => item.season === requestedSeason) || availableSeasons[0]) : null;
       const nextSeason = series ? (selectedSeason?.season || Math.max(1, requestedSeason || 1)) : 0;
       const nextEpisode = series ? Math.min(Math.max(1, requestedEpisode || 1), selectedSeason?.episode_count || Math.max(1, requestedEpisode || 1)) : 0;
-      const audioDetail = audioSubjectId === id ? nextDetail : await getDetail(audioSubjectId);
+      const audioDetail = audioSubjectId === id ? nextDetail : await getDetail(audioSubjectId, detailPath);
       const [streamResponse, captionResponse] = await Promise.all([
         getStreams(audioSubjectId, nextSeason, nextEpisode, audioDetail.detail_path || undefined),
-        getCaptions(audioSubjectId, nextSeason, nextEpisode),
+        getCaptions(audioSubjectId, nextSeason, nextEpisode).catch(() => ({ captions: [] as Subtitle[] })),
       ]);
       if (!active) return;
       if (!streamResponse.streams.length) throw new Error(`No ${audioDetail.language || "selected language"} audio stream is available for this episode.`);
@@ -183,13 +185,13 @@ function WatchPage() {
     }
     resolvePlayback().catch((cause: unknown) => { if (!active) return; if (audioSubjectId !== id) { audioSwitchRef.current = true; setAudioSubjectId(id); setError(""); return; } setError(cause instanceof Error ? cause.message : "We couldn't start this title."); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [id, requestedSeason, requestedEpisode, retryKey, audioSubjectId]);
+  }, [id, requestedSeason, requestedEpisode, detailPath, retryKey, audioSubjectId]);
   useEffect(() => { if (detail) setMeta(`Watch ${detail.title} · MovieBox Cinema`, valueOr(detail.description, `Now playing: ${detail.title}.`), detail.cover); }, [detail]);
   const currentSeason = episodes?.seasons.find((item) => item.season === season);
   const episodeCount = currentSeason?.episode_count || 0;
   const audioChoices = (detail?.dubs || []).filter((dub) => dub.subject_id && dub.lang_name && !/\bsub(?:title)?\b/i.test(dub.lang_name));
   function switchAudioLanguage(subjectId: string) { audioSwitchRef.current = true; setAudioSubjectId(subjectId); }
-  function goEpisode(nextSeason: number, nextEpisode: number) { setSearchParams({ season: String(nextSeason), episode: String(nextEpisode) }); setSeason(nextSeason); setEpisode(nextEpisode); }
+  function goEpisode(nextSeason: number, nextEpisode: number) { setSearchParams({ season: String(nextSeason), episode: String(nextEpisode), ...(detailPath ? { detail_path: detailPath } : {}) }); setSeason(nextSeason); setEpisode(nextEpisode); }
   function onEnded() { if (!isSeries || !episodes) return; if (episode < episodeCount) { goEpisode(season, episode + 1); return; } const currentIndex = episodes.seasons.findIndex((item) => item.season === season); const nextSeason = currentIndex >= 0 ? episodes.seasons[currentIndex + 1] : undefined; if (nextSeason) goEpisode(nextSeason.season, 1); }
   function save(position: number, duration: number) { if (!detail || position < 2) return; const record: ProgressRecord = { key: progressKey, subjectId: id, title: detail.title, cover: detail.cover, type: detail.type, season: isSeries ? season : undefined, episode: isSeries ? episode : undefined, position, duration, updatedAt: Date.now() }; saveProgress(record); }
   if (loading) return <Shell><div className="watch-page page-wrap"><div className="player-loading shimmer" /><div className="watch-skeleton-lines"><span className="shimmer" /><span className="shimmer short" /></div></div></Shell>;
