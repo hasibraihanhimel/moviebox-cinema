@@ -189,12 +189,15 @@ function subtitleSource(url: string, signal: AbortSignal): Promise<string> {
   return fetch(resolveApiUrl(url), { signal }).then((response) => { if (!response.ok) throw new Error("Subtitle unavailable"); return response.text(); }).then((text) => { const clean = text.replace(/^\uFEFF/, "").replace(/\r/g, "").trim(); if (/^WEBVTT/i.test(clean)) return clean; const converted = clean.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2"); return `WEBVTT\n\n${converted}`; });
 }
 
-function browserCanPlayStream(stream: Stream): boolean {
-  if (stream.is_browser_playable === false) return false;
+function isHevcStream(stream: Stream): boolean {
   const codec = String(stream.codec || "").toLowerCase();
   const url = String(stream.url || "").toLowerCase();
-  const isHevc = codec.includes("hevc") || codec.includes("h265") || url.includes("h265") || url.includes("hevc");
-  if (!isHevc) return true;
+  return codec.includes("hevc") || codec.includes("h265") || url.includes("h265") || url.includes("hevc");
+}
+
+function browserCanPlayStream(stream: Stream): boolean {
+  if (stream.is_browser_playable === false) return false;
+  if (!isHevcStream(stream)) return true;
   // DASH.js needs MSE support for HEVC, which is absent in many desktop browsers.
   const mediaSource = window.MediaSource;
   if (!mediaSource || typeof mediaSource.isTypeSupported !== "function") return false;
@@ -225,7 +228,15 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   const hideTimer = useRef<number | undefined>(undefined);
   const failedStreamIndices = useRef(new Set<number>());
   const lastAutoFallbackFrom = useRef<number | null>(null);
-  const playableStreams = useMemo(() => streams.filter(browserCanPlayStream), [streams]);
+  const playableStreams = useMemo(() => {
+    const browserPlayable = streams.filter(browserCanPlayStream);
+    // Prefer broadly supported H.264 MP4 sources when the provider returns
+    // them; some Chromium builds claim HEVC support but still cannot decode it.
+    const hasH264Mp4 = browserPlayable.some((candidate) =>
+      candidate.format.toLowerCase() === "mp4" && /h264|avc/i.test(candidate.codec || ""),
+    );
+    return hasH264Mp4 ? browserPlayable.filter((candidate) => !isHevcStream(candidate)) : browserPlayable;
+  }, [streams]);
   const stream = playableStreams[streamIndex];
   const qualityOptions = useMemo(() => playableStreams.filter((value, index, list) => list.findIndex((candidate) => candidate.quality === value.quality) === index), [playableStreams]);
 

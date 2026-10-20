@@ -1004,6 +1004,7 @@ def validate_subject_id(subject_id: str) -> str:
 
 def _gateway_headers(payload: Dict[str, Any], request: Request) -> Dict[str, str]:
     headers = {str(key): str(value) for key, value in (payload.get("headers") or {}).items() if key in {"User-Agent", "Referer", "Origin", "Accept"}}
+    headers.setdefault("Accept", "*/*")
     # Video CDNs may otherwise gzip/br-compress a ranged MP4 response. That
     # changes byte offsets and causes browsers to reject or stall seeking.
     headers["Accept-Encoding"] = "identity"
@@ -1013,10 +1014,46 @@ def _gateway_headers(payload: Dict[str, Any], request: Request) -> Dict[str, str
         headers["Range"] = request.headers["range"]
     return headers
 
-def _open_gateway_response(client: httpx.Client, method: str, target: str, headers: Dict[str, str]) -> tuple[httpx.Response, str]:
+def _new_gateway_client():
+    """Use the same browser TLS/HTTP fingerprint for CDN requests as the H5 API."""
+    if cr:
+        return cr.Session(impersonate="chrome120", verify=SYSTEM_CA_BUNDLE or True)
+    try:
+        return httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
+            verify=SYSTEM_CA_BUNDLE or True,
+            http2=True,
+        )
+    except ImportError:
+        return httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
+            verify=SYSTEM_CA_BUNDLE or True,
+        )
+
+def _gateway_request(client, method: str, target: str, headers: Dict[str, str]):
+    if cr and isinstance(client, cr.Session):
+        return client.request(
+            method,
+            target,
+            headers=headers,
+            timeout=60,
+            allow_redirects=False,
+            stream=True,
+            http_version="v2",
+        )
+    request = client.build_request(method, target, headers=headers)
+    return client.send(request, stream=True, follow_redirects=False)
+
+def _iter_gateway_bytes(upstream):
+    if hasattr(upstream, "iter_content"):
+        yield from upstream.iter_content()
+    else:
+        yield from upstream.iter_bytes(chunk_size=1024 * 1024)
+
+def _open_gateway_response(client, method: str, target: str, headers: Dict[str, str]):
     current = _validated_redirect_url(target)
     for _ in range(5):
-        response = client.send(client.build_request(method, current, headers=headers), stream=method != "HEAD", follow_redirects=False)
+        response = _gateway_request(client, method, current, headers)
         if response.status_code not in {301, 302, 303, 307, 308}:
             return response, current
         location = response.headers.get("location")
@@ -1031,7 +1068,7 @@ def _stream_gateway_response(payload: Dict[str, Any], request: Request) -> Respo
     target = str(payload.get("url") or "")
     if not _media_host_allowed(target):
         raise HTTPException(status_code=502, detail="Playback source is not an approved media host.")
-    client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0), verify=SYSTEM_CA_BUNDLE or True)
+    client = _new_gateway_client()
     upstream, final_url = _open_gateway_response(client, request.method, target, _gateway_headers(payload, request))
     if upstream.status_code not in (200, 206):
         status = upstream.status_code
@@ -1052,7 +1089,7 @@ def _stream_gateway_response(payload: Dict[str, Any], request: Request) -> Respo
 
     def body():
         try:
-            for chunk in upstream.iter_bytes(1024 * 1024):
+            for chunk in _iter_gateway_bytes(upstream):
                 if chunk:
                     yield chunk
         finally:
@@ -1072,7 +1109,7 @@ def playback_manifest_or_media(token: str, request: Request):
     if payload.get("kind") != "dash":
         return _stream_gateway_response(payload, request)
     target = str(payload.get("url") or "")
-    client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0), verify=SYSTEM_CA_BUNDLE or True)
+    client = _new_gateway_client()
     upstream, final_url = _open_gateway_response(client, request.method, target, _gateway_headers(payload, request))
     if upstream.status_code != 200:
         upstream.close(); client.close()
@@ -1082,7 +1119,7 @@ def playback_manifest_or_media(token: str, request: Request):
         headers = {key: upstream.headers[key] for key in ("content-type", "content-length", "etag", "last-modified") if key in upstream.headers}
         upstream.close(); client.close()
         return Response(status_code=200, headers=headers, media_type="application/dash+xml")
-    manifest = upstream.text
+    manifest = b"".join(_iter_gateway_bytes(upstream)).decode("utf-8-sig", errors="replace")
     upstream.close(); client.close()
     gateway_base = f"/api/playback/{token}/"
     manifest = _rewrite_dash_manifest(manifest, gateway_base)
