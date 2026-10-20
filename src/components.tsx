@@ -189,6 +189,20 @@ function subtitleSource(url: string, signal: AbortSignal): Promise<string> {
   return fetch(resolveApiUrl(url), { signal }).then((response) => { if (!response.ok) throw new Error("Subtitle unavailable"); return response.text(); }).then((text) => { const clean = text.replace(/^\uFEFF/, "").replace(/\r/g, "").trim(); if (/^WEBVTT/i.test(clean)) return clean; const converted = clean.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2"); return `WEBVTT\n\n${converted}`; });
 }
 
+function browserCanPlayStream(stream: Stream): boolean {
+  if (stream.is_browser_playable === false) return false;
+  const codec = String(stream.codec || "").toLowerCase();
+  const url = String(stream.url || "").toLowerCase();
+  const isHevc = codec.includes("hevc") || codec.includes("h265") || url.includes("h265") || url.includes("hevc");
+  if (!isHevc) return true;
+  // DASH.js needs MSE support for HEVC, which is absent in many desktop browsers.
+  const mediaSource = window.MediaSource;
+  if (!mediaSource || typeof mediaSource.isTypeSupported !== "function") return false;
+  return ["hvc1", "hev1", "hvc1.1.6.L93.B0", "hev1.1.6.L93.B0"].some((profile) =>
+    mediaSource.isTypeSupported(`video/mp4; codecs="${profile}"`),
+  );
+}
+
 export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, onProgress, onRetry, onEnded }: { streams: Stream[]; captions: Subtitle[]; allowed: boolean; initialPosition?: number; onProgress?: (position: number, duration: number) => void; onRetry?: () => void; onEnded?: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const engineRef = useRef<PlaybackEngine | null>(null);
@@ -211,8 +225,9 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   const hideTimer = useRef<number | undefined>(undefined);
   const failedStreamIndices = useRef(new Set<number>());
   const lastAutoFallbackFrom = useRef<number | null>(null);
-  const stream = streams[streamIndex];
-  const qualityOptions = useMemo(() => streams.filter((value, index, list) => list.findIndex((candidate) => candidate.quality === value.quality) === index), [streams]);
+  const playableStreams = useMemo(() => streams.filter(browserCanPlayStream), [streams]);
+  const stream = playableStreams[streamIndex];
+  const qualityOptions = useMemo(() => playableStreams.filter((value, index, list) => list.findIndex((candidate) => candidate.quality === value.quality) === index), [playableStreams]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -224,7 +239,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   function advanceAfterFailure(index: number): boolean {
     if (failedStreamIndices.current.has(index)) return lastAutoFallbackFrom.current === index;
     failedStreamIndices.current.add(index);
-    const nextIndex = streams.findIndex((_candidate, candidateIndex) => !failedStreamIndices.current.has(candidateIndex));
+    const nextIndex = playableStreams.findIndex((_candidate, candidateIndex) => !failedStreamIndices.current.has(candidateIndex));
     if (nextIndex < 0) return false;
     lastAutoFallbackFrom.current = index;
     resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused && allowed);
@@ -235,13 +250,13 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
   useEffect(() => {
     failedStreamIndices.current.clear();
     lastAutoFallbackFrom.current = null;
-    const startupIndex = streams.reduce((best, candidate, index, list) => {
+    const startupIndex = playableStreams.reduce((best, candidate, index, list) => {
       const quality = Number(candidate.quality_value || candidate.quality.match(/\d+/)?.[0] || 0);
       const bestQuality = best < 0 ? 0 : Number(list[best]?.quality_value || list[best]?.quality.match(/\d+/)?.[0] || 0);
       return quality <= 720 && quality > bestQuality ? index : best;
     }, -1);
     setStreamIndex(startupIndex < 0 ? 0 : startupIndex);
-  }, [streams]);
+  }, [playableStreams]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -286,11 +301,11 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     window.addEventListener("keydown", keyboard);
     return () => window.removeEventListener("keydown", keyboard);
   });
-  if (!stream) return <div className="player-shell player-empty"><Film size={25} /><p>No playable stream was returned for this title.</p>{onRetry && <button className="button button-primary" onClick={onRetry}>Resolve again</button>}</div>;
+  if (!stream) return <div className="player-shell player-empty"><Film size={25} /><p>{streams.length ? "This browser doesn't support the available video formats." : "No playable stream was returned for this title."}</p>{onRetry && <button className="button button-primary" onClick={onRetry}>Resolve again</button>}</div>;
 
   async function togglePlay() { const video = videoRef.current; const engine = engineRef.current; if (!video || !engine || !allowed) return; if (video.paused) { try { await engine.play(); } catch (cause: unknown) { if (import.meta.env.DEV) console.warn("[MovieBox playback] play blocked", cause); setError("Playback was blocked by the browser. Press play to try again."); } } else engine.pause(); }
   async function toggleFullscreen() { const root = videoRef.current?.parentElement?.parentElement; if (!root) return; if (!document.fullscreenElement) { await root.requestFullscreen?.(); setFullscreen(true); } else { await document.exitFullscreen?.(); setFullscreen(false); } }
-  function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = streams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; lastAutoFallbackFrom.current = null; resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); setStreamIndex(next); }
+  function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = playableStreams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; lastAutoFallbackFrom.current = null; resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); setStreamIndex(next); }
   function signalActivity() { setShowControls(true); if (hideTimer.current) window.clearTimeout(hideTimer.current); if (playing) hideTimer.current = window.setTimeout(() => setShowControls(false), 2600); }
   function handleTime(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setCurrentTime(video.currentTime); if (Math.abs(video.currentTime - saveRef.current) > 3 || video.currentTime === 0) { saveRef.current = video.currentTime; onProgress?.(video.currentTime, video.duration || duration); } }
   function handleMetadata(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setDuration(video.duration || 0); setBuffering(false); if (!positionApplied && initialPosition > 0) { video.currentTime = Math.min(initialPosition, Math.max(0, (video.duration || initialPosition) - 4)); setPositionApplied(true); } if (allowed && resumeAfterLoadRef.current) { resumeAfterLoadRef.current = false; void engineRef.current?.play().catch(() => undefined); } }

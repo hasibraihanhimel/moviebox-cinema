@@ -14,7 +14,8 @@ export interface PlaybackEngine {
 }
 
 function sourceFor(stream: Stream): string {
-  return resolveApiUrl(stream.playback_url || stream.url);
+  const resolved = resolveApiUrl(stream.playback_url || stream.url);
+  return new URL(resolved, window.location.href).href;
 }
 
 export class NativeVideoEngine implements PlaybackEngine {

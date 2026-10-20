@@ -293,6 +293,9 @@ def _normalize_stream(stream: Dict[str, Any]) -> Dict[str, Any]:
     url = str(stream.get("url") or "")
     raw_format = str(stream.get("format") or "").lower()
     raw_codec = str(stream.get("codec") or "").lower()
+    if not raw_codec or raw_codec == "unknown":
+        path = url.lower()
+        raw_codec = "hevc" if any(value in path for value in ("h265", "hevc")) else "h264" if any(value in path for value in ("h264", "avc")) else ""
     is_dash = raw_format in {"dash", "mpd"} or ".mpd" in url.lower()
     is_mp4 = raw_format == "mp4" or ".mp4" in url.lower()
     has_h264 = any(value in raw_codec for value in ("h264", "avc"))
@@ -318,7 +321,7 @@ def _search_items(data: Any) -> List[Dict[str, Any]]:
         if not isinstance(current, dict):
             return []
         empty_list = None
-        for key in ("items", "subjects", "list", "results"):
+        for key in ("items", "subjects", "list", "results", "subjectList", "contentList", "movie"):
             value = current.get(key)
             if isinstance(value, list):
                 items = [item for item in value if isinstance(item, dict)]
@@ -429,8 +432,12 @@ class MovieBoxEngine:
             "Referer": "https://moviebox.ph/",
             "Origin": "https://moviebox.ph",
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "x-client-info": json.dumps({"timezone": "Asia/Dhaka"}, separators=(",", ":")),
             "x-request-lang": "en",
             "x-source": "moviebox",
+            "x-vip-restrict": "0",
+            "x-no-high-risk-restrict": "0",
         }
         if method.upper() == "POST":
             response = self.session.post(url, params=params, headers=headers, json=body or {}, timeout=20)
@@ -845,6 +852,9 @@ def validate_subject_id(subject_id: str) -> str:
 
 def _gateway_headers(payload: Dict[str, Any], request: Request) -> Dict[str, str]:
     headers = {str(key): str(value) for key, value in (payload.get("headers") or {}).items() if key in {"User-Agent", "Referer", "Origin", "Accept"}}
+    # Video CDNs may otherwise gzip/br-compress a ranged MP4 response. That
+    # changes byte offsets and causes browsers to reject or stall seeking.
+    headers["Accept-Encoding"] = "identity"
     if payload.get("cookie"):
         headers["Cookie"] = str(payload["cookie"])
     if request.headers.get("range"):
@@ -877,11 +887,16 @@ def _stream_gateway_response(payload: Dict[str, Any], request: Request) -> Respo
         logger.warning("media gateway upstream failure", extra={"status": status, "host": urlsplit(target).hostname})
         raise HTTPException(status_code=502, detail=f"Media source returned HTTP {status}")
 
-    passthrough = {key: upstream.headers[key] for key in ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified") if key in upstream.headers}
+    media_type = upstream.headers.get("content-type", "")
+    if media_type.split(";", 1)[0].strip().lower() in {"", "application/octet-stream", "binary/octet-stream"} and urlsplit(final_url).path.lower().endswith(".mp4"):
+        media_type = "video/mp4"
+    passthrough = {key: upstream.headers[key] for key in ("content-length", "content-range", "accept-ranges", "etag", "last-modified") if key in upstream.headers}
+    if media_type:
+        passthrough["Content-Type"] = media_type
     passthrough["Cache-Control"] = "no-store"
     if request.method == "HEAD":
         upstream.close(); client.close()
-        return Response(status_code=upstream.status_code, headers=passthrough, media_type=upstream.headers.get("content-type"))
+        return Response(status_code=upstream.status_code, headers=passthrough, media_type=media_type or None)
 
     def body():
         try:
@@ -891,7 +906,7 @@ def _stream_gateway_response(payload: Dict[str, Any], request: Request) -> Respo
         finally:
             upstream.close(); client.close()
 
-    return StreamingResponse(body(), status_code=upstream.status_code, headers=passthrough, media_type=upstream.headers.get("content-type", "application/octet-stream"))
+    return StreamingResponse(body(), status_code=upstream.status_code, headers=passthrough, media_type=media_type or "application/octet-stream")
 
 def _rewrite_dash_manifest(manifest: str, gateway_base: str) -> str:
     base_pattern = r"(<BaseURL(?:\s[^>]*)?>).*?(</BaseURL>)"
@@ -947,12 +962,9 @@ def search(q: str = Query(..., min_length=1, max_length=120), page: int = Query(
 
 @app.get("/search/suggest")
 def search_suggest(q: str = Query(..., min_length=1, max_length=120)):
-    url = f"{API_BASE}/subject/search-suggest"
-    headers = {"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}
     try:
-        resp = engine.session.post(url, headers=headers, json={"keyword": q, "perPage": 10}, timeout=15)
-        response = resp.json()
-        raw = _search_items(response.get("data", response) if isinstance(response, dict) else response)
+        response = engine.h5_request("POST", "/subject/search-suggest", body={"keyword": q, "perPage": 10})
+        raw = _search_items(_upstream_data(response))
     except Exception:
         raw = []
     suggestions = []

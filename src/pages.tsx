@@ -83,6 +83,8 @@ function SearchPage() {
   useEffect(() => { if (browseType === "Movie" || browseType === "Series") setType(browseType); }, [browseType]);
   useEffect(() => {
     setPage(requestedPage);
+    // Do not leave the previous query's cards visible under a new query's error.
+    setResults([]);
     const controller = new AbortController();
     setError("");
     if (!query.trim() && (browseType === "Movie" || browseType === "Series")) {
