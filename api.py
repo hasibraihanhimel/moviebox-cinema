@@ -299,13 +299,13 @@ def _decode_playback_token(token: str) -> Dict[str, Any]:
 
 def _normalize_stream(stream: Dict[str, Any]) -> Dict[str, Any]:
     url = str(stream.get("url") or "")
-    raw_format = str(stream.get("format") or "").lower()
+    raw_format = str(stream.get("format") or "").split(";", 1)[0].strip().lower()
     raw_codec = str(stream.get("codec") or "").lower()
     if not raw_codec or raw_codec == "unknown":
         path = url.lower()
         raw_codec = "hevc" if any(value in path for value in ("h265", "hevc")) else "h264" if any(value in path for value in ("h264", "avc")) else ""
-    is_dash = raw_format in {"dash", "mpd"} or ".mpd" in url.lower()
-    is_mp4 = raw_format == "mp4" or ".mp4" in url.lower()
+    is_dash = raw_format in {"dash", "mpd", "application/dash+xml"} or ".mpd" in url.lower()
+    is_mp4 = raw_format in {"mp4", "video/mp4", "application/mp4"} or ".mp4" in url.lower()
     has_h264 = any(value in raw_codec for value in ("h264", "avc"))
     has_hevc = any(value in raw_codec for value in ("hevc", "h265", "x265"))
     codec = "unknown" if has_h264 and has_hevc else "h264" if has_h264 else "hevc" if has_hevc else (raw_codec or "unknown")
@@ -316,7 +316,7 @@ def _normalize_stream(stream: Dict[str, Any]) -> Dict[str, Any]:
     stream["is_browser_playable"] = bool(is_mp4 or is_dash)
     stream["requires_headers"] = requires_headers
     stream["requires_proxy"] = True
-    stream["playback_url"] = f"/api/playback/{_encode_playback_token({'url': url, 'headers': stream.get('headers') or {}, 'cookie': stream.get('cookie') or '', 'kind': 'dash' if is_dash else 'media'})}"
+    stream["playback_url"] = f"/api/playback/{_encode_playback_token({'url': url, 'headers': stream.get('headers') or {}, 'cookie': stream.get('cookie') or '', 'kind': 'dash' if is_dash else 'media', 'mime_type': 'application/dash+xml' if is_dash else 'video/mp4' if is_mp4 else ''})}"
     return stream
 
 
@@ -1077,8 +1077,8 @@ def _stream_gateway_response(payload: Dict[str, Any], request: Request) -> Respo
         raise HTTPException(status_code=502, detail=f"Media source returned HTTP {status}")
 
     media_type = upstream.headers.get("content-type", "")
-    if media_type.split(";", 1)[0].strip().lower() in {"", "application/octet-stream", "binary/octet-stream"} and urlsplit(final_url).path.lower().endswith(".mp4"):
-        media_type = "video/mp4"
+    if media_type.split(";", 1)[0].strip().lower() in {"", "application/octet-stream", "binary/octet-stream"}:
+        media_type = str(payload.get("mime_type") or ("video/mp4" if urlsplit(final_url).path.lower().endswith(".mp4") else media_type))
     passthrough = {key: upstream.headers[key] for key in ("content-length", "content-range", "accept-ranges", "etag", "last-modified") if key in upstream.headers}
     if media_type:
         passthrough["Content-Type"] = media_type
@@ -1133,7 +1133,7 @@ def playback_dash_asset(token: str, asset: str, request: Request):
     target = urljoin(str(payload.get("url") or ""), asset)
     if not _media_host_allowed(target):
         raise HTTPException(status_code=502, detail="Playback asset resolved to a disallowed host.")
-    child = dict(payload); child["url"] = target
+    child = dict(payload); child["url"] = target; child.pop("mime_type", None)
     return _stream_gateway_response(child, request)
 
 @app.get("/", include_in_schema=False)

@@ -233,7 +233,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     // Prefer broadly supported H.264 MP4 sources when the provider returns
     // them; some Chromium builds claim HEVC support but still cannot decode it.
     const hasH264Mp4 = browserPlayable.some((candidate) =>
-      candidate.format.toLowerCase() === "mp4" && /h264|avc/i.test(candidate.codec || ""),
+      candidate.format?.toLowerCase() === "mp4" && /h264|avc/i.test(candidate.codec || ""),
     );
     return hasH264Mp4 ? browserPlayable.filter((candidate) => !isHevcStream(candidate)) : browserPlayable;
   }, [streams]);
@@ -266,6 +266,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
       const bestQuality = best < 0 ? 0 : Number(list[best]?.quality_value || list[best]?.quality.match(/\d+/)?.[0] || 0);
       return quality <= 720 && quality > bestQuality ? index : best;
     }, -1);
+    setPositionApplied(false);
     setStreamIndex(startupIndex < 0 ? 0 : startupIndex);
   }, [playableStreams]);
 
@@ -275,7 +276,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     let active = true;
     const startAt = video.currentTime > 0 ? video.currentTime : initialPosition;
     const shouldResume = Boolean(!video.paused && allowed);
-    setPositionApplied(false); setError(""); setBuffering(true);
+    setError(""); setBuffering(true);
     video.pause();
     engineRef.current?.destroy();
     const engine = createPlaybackEngine(video, stream, (diagnostic: PlaybackError) => {
@@ -319,7 +320,7 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
 
   async function togglePlay() { const video = videoRef.current; const engine = engineRef.current; if (!video || !engine || !allowed) return; if (video.paused) { try { await engine.play(); } catch (cause: unknown) { if (import.meta.env.DEV) console.warn("[MovieBox playback] play blocked", cause); setError("Playback was blocked by the browser. Press play to try again."); } } else engine.pause(); }
   async function toggleFullscreen() { const root = videoRef.current?.parentElement?.parentElement; if (!root) return; if (!document.fullscreenElement) { await root.requestFullscreen?.(); setFullscreen(true); } else { await document.exitFullscreen?.(); setFullscreen(false); } }
-  function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = playableStreams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; lastAutoFallbackFrom.current = null; resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); setStreamIndex(next); }
+  function switchQuality(event: ChangeEvent<HTMLSelectElement>) { const next = playableStreams.findIndex((candidate) => candidate.quality === event.target.value); if (next < 0 || next === streamIndex) return; failedStreamIndices.current.clear(); lastAutoFallbackFrom.current = null; resumeAfterLoadRef.current = Boolean(videoRef.current && !videoRef.current.paused); setStreamIndex(next); }
   function signalActivity() { setShowControls(true); if (hideTimer.current) window.clearTimeout(hideTimer.current); if (playing) hideTimer.current = window.setTimeout(() => setShowControls(false), 2600); }
   function handleTime(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setCurrentTime(video.currentTime); if (Math.abs(video.currentTime - saveRef.current) > 3 || video.currentTime === 0) { saveRef.current = video.currentTime; onProgress?.(video.currentTime, video.duration || duration); } }
   function handleMetadata(event: React.SyntheticEvent<HTMLVideoElement>) { const video = event.currentTarget; setDuration(video.duration || 0); setBuffering(false); if (!positionApplied && initialPosition > 0) { video.currentTime = Math.min(initialPosition, Math.max(0, (video.duration || initialPosition) - 4)); setPositionApplied(true); } if (allowed && resumeAfterLoadRef.current) { resumeAfterLoadRef.current = false; void engineRef.current?.play().catch(() => undefined); } }
