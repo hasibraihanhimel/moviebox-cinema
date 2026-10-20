@@ -1,0 +1,10 @@
+{
+  "routes": [
+    { "path": "/", "title": "MovieBox Cinema" },
+    { "path": "/search", "title": "Search · MovieBox Cinema" },
+    { "path": "/movie/:id", "title": "Movie · MovieBox Cinema" },
+    { "path": "/series/:id", "title": "Series · MovieBox Cinema" },
+    { "path": "/watch/:id", "title": "Watch · MovieBox Cinema" },
+    { "path": "/*", "title": "MovieBox Cinema" }
+  ]
+}

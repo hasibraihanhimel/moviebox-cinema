@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: moviebox-cinema
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PROXY_SIGNING_SECRET
+        generateValue: true
+      - key: PROXY_TOKEN_TTL_SECONDS
+        value: "900"
+      - key: VITE_ENABLE_ADS
+        value: "true"
+      - key: VITE_ENABLE_PREPLAY_AD
+        value: "true"
+      - key: VITE_SMART_LINK_URL
+        value: https://auctionr.org/4/c69074fbf2990ba792cfbf352a8e12ff
