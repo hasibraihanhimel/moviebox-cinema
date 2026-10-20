@@ -62,9 +62,11 @@ export class DashPlaybackEngine implements PlaybackEngine {
       this.player = player;
       player.on(dashjs.MediaPlayer.events.ERROR, (event: unknown) => {
         const data = event as { error?: { message?: string; code?: number } };
-        const error = { code: data.error?.code, message: data.error?.message || "DASH manifest or segment failed.", source: "dash" };
+        // dash.js error text may contain the full signed playback URL. Keep it
+        // in diagnostics only; the UI should never expose provider tokens.
+        const error = { code: data.error?.code, message: "The selected stream could not be loaded.", source: "dash" };
         this.onError(error);
-        finishError(new Error(error.message));
+        finishError(new Error("The selected stream could not be loaded."));
       });
       player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
         if (startAt > 0 && Number.isFinite(this.video.duration)) this.video.currentTime = Math.min(startAt, Math.max(0, this.video.duration - 4));

@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -103,7 +103,7 @@ def health_check() -> Dict[str, str]:
 SECRET_KEY_DEFAULT_B64 = "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
 SECRET_KEY_ALT_B64 = "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
 MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_IN; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
-WEB_USER_AGENT = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
+WEB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 NATIVE_API_BASE = "https://api3.aoneroom.com"
 BOOTSTRAP_HOST = "https://apig.inmoviebox.com"
@@ -111,15 +111,23 @@ BOOTSTRAP_URL = f"{BOOTSTRAP_HOST}/wefeed-mobile-bff/tab/ranking-list?tabId=0&ca
 
 WEB_DOMAINS = [
     "https://h5-api.aoneroom.com",
-    "https://123moviesfree.club",
     "https://movie-box.co",
     "https://movieboxonline.net",
     "https://sflix.film",
-    "https://netnaija.film",
-    "https://movieboxhd.net",
+]
+H5_PROVIDER_HOSTS = [
+    "moviebox.ph",
+    "movie-box.co",
+    "movieboxonline.net",
+    "sflix.film",
 ]
 
-PROXY_SIGNING_SECRET = os.getenv("PROXY_SIGNING_SECRET") or secrets.token_urlsafe(32)
+# A per-process random fallback breaks signed playback URLs when Render routes
+# manifest and segment requests to different workers or restarts the process.
+# Honor an explicit deployment secret; otherwise use a stable app-specific key.
+PROXY_SIGNING_SECRET = os.getenv("PROXY_SIGNING_SECRET") or hashlib.sha256(
+    f"moviebox-playback-proxy-v1:{SECRET_KEY_DEFAULT_B64}".encode("utf-8")
+).hexdigest()
 # Playback URLs are also used by the browser for every DASH segment request.
 # Keep their signatures alive for a full feature film, including pauses.
 PROXY_TOKEN_TTL_SECONDS = max(60, int(os.getenv("PROXY_TOKEN_TTL_SECONDS", "21600")))
@@ -363,6 +371,11 @@ class MovieBoxEngine:
     def __init__(self):
         self.device_id = generate_device_id()
         self.bearer_token: Optional[str] = None
+        self.h5_tokens: Dict[str, str] = {}
+        self.active_h5_host = "moviebox.ph"
+        self.player_domain: Optional[str] = None
+        self.player_domain_host: Optional[str] = None
+        self.player_domain_expires = 0.0
         if cr:
             self.session = cr.Session(impersonate="chrome120", verify=SYSTEM_CA_BUNDLE or True)
         else:
@@ -374,17 +387,17 @@ class MovieBoxEngine:
             cls._instance = MovieBoxEngine()
         return cls._instance
 
-    def bootstrap_token(self, force: bool = False) -> str:
+    def bootstrap_token(self, force: bool = False, timeout: float = 20) -> str:
         if self.bearer_token and not force:
             return self.bearer_token
         headers = build_auth_headers("GET", BOOTSTRAP_URL, device_id=self.device_id)
-        resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=20)
+        resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=timeout)
         x_user = resp.headers.get("x-user")
         if not x_user:
             # Render regions can be blocked by the native bootstrap host even
             # while the public H5 service remains available.
             try:
-                self.h5_request("GET", "/home", params={"host": "moviebox.ph"})
+                self.h5_request("GET", "/home", params={"host": self.active_h5_host}, timeout=min(timeout, 3))
             except Exception:
                 pass
             if self.bearer_token:
@@ -397,13 +410,13 @@ class MovieBoxEngine:
         self.bearer_token = token
         return token
 
-    def api_request(self, method: str, path_or_url: str, body_dict: Optional[Dict[str, Any]] = None, use_token: bool = True, retry_auth: bool = True) -> Dict[str, Any]:
+    def api_request(self, method: str, path_or_url: str, body_dict: Optional[Dict[str, Any]] = None, use_token: bool = True, retry_auth: bool = True, timeout: float = 25) -> Dict[str, Any]:
         if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
             full_url = path_or_url
         else:
             full_url = f"{NATIVE_API_BASE}{path_or_url}"
         if use_token and not self.bearer_token:
-            self.bootstrap_token()
+            self.bootstrap_token(timeout=timeout)
         body_str = json.dumps(body_dict, separators=(",", ":")) if body_dict is not None else None
         headers = build_auth_headers(
             method=method,
@@ -414,62 +427,130 @@ class MovieBoxEngine:
         )
         data_bytes = body_str.encode("utf-8") if body_str is not None else None
         if method.upper() == "POST":
-            resp = self.session.post(full_url, headers=headers, data=data_bytes, timeout=25)
+            resp = self.session.post(full_url, headers=headers, data=data_bytes, timeout=timeout)
         else:
-            resp = self.session.get(full_url, headers=headers, timeout=25)
+            resp = self.session.get(full_url, headers=headers, timeout=timeout)
         if resp.status_code in (401, 441) and retry_auth:
-            self.bootstrap_token(force=True)
-            return self.api_request(method, path_or_url, body_dict, use_token, retry_auth=False)
+            self.bootstrap_token(force=True, timeout=timeout)
+            return self.api_request(method, path_or_url, body_dict, use_token, retry_auth=False, timeout=timeout)
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"API returned HTTP {resp.status_code}")
         return resp.json()
 
-    def h5_request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Any:
-        """Call the public web BFF, which is reachable on Render without mobile bootstrap."""
+    def h5_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        body: Optional[Dict[str, Any]] = None,
+        *,
+        host: Optional[str] = None,
+        referer: Optional[str] = None,
+        origin: Optional[str] = None,
+        timeout: float = 20,
+        retry_auth: bool = True,
+    ) -> Any:
+        """Call the H5 BFF with its per-host guest session and provider context."""
+        provider_host = host or str((params or {}).get("host") or self.active_h5_host)
+        query = dict(params or {})
+        query.setdefault("host", provider_host)
+        clean_path = path.split("?", 1)[0].rstrip("/") or "/"
+
+        guest_token = self.h5_tokens.get(provider_host)
+        if clean_path != "/home" and not guest_token:
+            try:
+                self.h5_request(
+                    "GET", "/home", params={"host": provider_host}, host=provider_host,
+                    timeout=min(timeout, 3), retry_auth=False,
+                )
+                guest_token = self.h5_tokens.get(provider_host)
+            except Exception as exc:
+                logger.info("H5 guest token bootstrap unavailable for %s: %s", provider_host, exc)
+
         url = f"{API_BASE}/{path.lstrip('/')}"
+        site_origin = f"https://{provider_host}"
         headers = {
             "User-Agent": WEB_USER_AGENT,
-            "Referer": "https://moviebox.ph/",
-            "Origin": "https://moviebox.ph",
-            "Accept": "application/json, text/plain, */*",
+            "Referer": referer or f"{site_origin}/",
+            "Origin": origin or site_origin,
+            "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
             "x-client-info": json.dumps({"timezone": "Asia/Dhaka"}, separators=(",", ":")),
             "x-request-lang": "en",
-            "x-source": "moviebox",
             "x-vip-restrict": "0",
             "x-no-high-risk-restrict": "0",
+            "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not/A)Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
         }
+        if guest_token:
+            headers["Authorization"] = f"Bearer {guest_token}"
         if method.upper() == "POST":
-            response = self.session.post(url, params=params, headers=headers, json=body or {}, timeout=20)
+            response = self.session.post(url, params=query, headers=headers, json=body or {}, timeout=timeout)
         else:
-            response = self.session.get(url, params=params, headers=headers, timeout=20)
+            response = self.session.get(url, params=query, headers=headers, timeout=timeout)
+        if response.status_code in (401, 403, 441) and guest_token and retry_auth:
+            self.h5_tokens.pop(provider_host, None)
+            try:
+                self.h5_request(
+                    "GET", "/home", params={"host": provider_host}, host=provider_host,
+                    timeout=min(timeout, 3), retry_auth=False,
+                )
+                return self.h5_request(
+                    method, path, params=query, body=body, host=provider_host,
+                    referer=referer, origin=origin, timeout=timeout, retry_auth=False,
+                )
+            except Exception as exc:
+                logger.info("H5 guest token refresh unavailable for %s: %s", provider_host, exc)
         if response.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Web catalog returned HTTP {response.status_code}")
+        self.active_h5_host = provider_host
         x_user = response.headers.get("x-user")
+        token = None
         if x_user:
             try:
                 token_data = json.loads(x_user)
                 token = token_data.get("token") if isinstance(token_data, dict) else None
-                if token:
-                    self.bearer_token = str(token)
             except (TypeError, json.JSONDecodeError):
                 logger.debug("Ignoring malformed H5 guest token header")
+        if not token:
+            cookie = response.headers.get("set-cookie", "")
+            match = re.search(r'(?:^|[,;\s])token=([^;,"\s]+)', cookie)
+            token = match.group(1) if match else None
+        if token:
+            self.h5_tokens[provider_host] = str(token)
+            if not self.bearer_token:
+                self.bearer_token = str(token)
         return response.json()
 
     def search(self, query: str, page: int = 1, per_page: int = 20) -> List[Dict[str, Any]]:
-        # The H5 search route is the same route used by the website and does not
-        # require the mobile guest token that is blocked from some Render regions.
-        for payload in (
-            {"keyword": query, "page": page, "perPage": per_page, "subjectType": 5},
-            {"keyword": query, "page": page, "perPage": per_page},
-        ):
+        # The H5 API requires a guest session and a mirror host. Fail over across
+        # its known hosts because availability and search policy vary by region.
+        payload = {"keyword": query, "page": page, "perPage": per_page}
+        last_h5_error: Optional[Exception] = None
+        for provider_host in H5_PROVIDER_HOSTS:
             try:
-                response = self.h5_request("POST", "/subject/search", body=payload)
+                response = self.h5_request(
+                    "POST", "/subject/search", params={"host": provider_host},
+                    body=payload, host=provider_host, timeout=5,
+                )
                 data = _search_items(_upstream_data(response))
                 if data:
                     return self._map_subjects(data)
             except Exception as exc:
-                logger.info("H5 search variant unavailable, trying next: %s", exc)
+                last_h5_error = exc
+                logger.info("H5 search unavailable on %s: %s", provider_host, exc)
+        if last_h5_error:
+            logger.info("All H5 search providers were exhausted; trying the signed mobile API")
+        # Do not start a second token bootstrap when Render could not establish
+        # the web session; it only adds a long wait before the same 502.
+        if not self.bearer_token:
+            raise last_h5_error or HTTPException(status_code=502, detail="Search is unavailable")
         # The upstream recently changed the accepted pagination fields. Try
         # the current contract first and keep the prior contract as fallback.
         variants = [
@@ -482,7 +563,7 @@ class MovieBoxEngine:
         last_error: Optional[HTTPException] = None
         for url, payload in variants:
             try:
-                response = self.api_request("POST", url, body_dict=payload)
+                response = self.api_request("POST", url, body_dict=payload, timeout=6)
                 candidate = response.get("data", response) if isinstance(response, dict) else response
                 items = _search_items(candidate)
                 if items:
@@ -531,7 +612,7 @@ class MovieBoxEngine:
     def get_details(self, subject_id: str, detail_path: Optional[str] = None) -> Dict[str, Any]:
         if detail_path:
             try:
-                response = self.h5_request("GET", "/detail", params={"detailPath": detail_path, "host": "moviebox.ph"})
+                response = self.h5_request("GET", "/detail", params={"detailPath": detail_path, "host": self.active_h5_host})
                 data = _upstream_data(response)
                 subject = data.get("subject") if isinstance(data, dict) and isinstance(data.get("subject"), dict) else data
                 if isinstance(subject, dict) and (subject.get("subjectId") or subject.get("subject_id") or subject.get("id")):
@@ -541,7 +622,7 @@ class MovieBoxEngine:
         # Resolve the slug from the working home feed when older direct links do
         # not carry it, then fetch the H5 detail instead of relying on mobile auth.
         try:
-            home = _upstream_data(self.h5_request("GET", "/home", params={"host": "moviebox.ph"}))
+            home = _upstream_data(self.h5_request("GET", "/home", params={"host": self.active_h5_host}))
             for section in home.get("operatingList", []) if isinstance(home, dict) else []:
                 candidates = (section.get("subjects") or []) if isinstance(section, dict) else []
                 banner = section.get("banner", {}) if isinstance(section, dict) else {}
@@ -551,7 +632,7 @@ class MovieBoxEngine:
                     if str(sub.get("subjectId") or sub.get("subject_id") or sub.get("id") or "") == subject_id:
                         slug = sub.get("detailPath") or sub.get("detail_path") or sub.get("slug")
                         if slug:
-                            response = self.h5_request("GET", "/detail", params={"detailPath": slug, "host": "moviebox.ph"})
+                            response = self.h5_request("GET", "/detail", params={"detailPath": slug, "host": self.active_h5_host})
                             data = _upstream_data(response)
                             detail = data.get("subject") if isinstance(data, dict) and isinstance(data.get("subject"), dict) else data
                             if isinstance(detail, dict) and (detail.get("title") or detail.get("name")):
@@ -559,7 +640,7 @@ class MovieBoxEngine:
         except Exception as exc:
             logger.info("H5 detail lookup failed for %s: %s", subject_id, exc)
         url = f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}"
-        data = self.api_request("GET", url).get("data", {})
+        data = self.api_request("GET", url, timeout=8).get("data", {})
         detail_url_str = data.get("detailUrl", "")
         detail_path = detail_url_str.split("/")[-1] if "/" in detail_url_str else detail_url_str
         return {
@@ -617,7 +698,7 @@ class MovieBoxEngine:
 
     def get_episodes(self, subject_id: str) -> List[Dict[str, Any]]:
         url = f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}"
-        res = self.api_request("GET", url)
+        res = self.api_request("GET", url, timeout=8)
         seasons = res.get("data", {}).get("seasons", [])
         season_list = []
         for s in seasons:
@@ -628,6 +709,47 @@ class MovieBoxEngine:
             })
         return season_list
 
+    def get_player_domain(self) -> str:
+        """Resolve the H5 playback API domain for the active provider host."""
+        provider_host = self.active_h5_host
+        if self.player_domain and self.player_domain_host == provider_host and self.player_domain_expires > time.time():
+            return self.player_domain
+        try:
+            response = self.h5_request(
+                "GET", "/media-player/get-domain", host=provider_host, timeout=5,
+            )
+            value = _upstream_data(response)
+            if isinstance(value, dict):
+                value = value.get("domain") or value.get("url") or value.get("host")
+            domain = str(value or "").strip().rstrip("/")
+            if domain and not urlsplit(domain).scheme:
+                domain = f"https://{domain}"
+            parsed = urlsplit(domain)
+            if parsed.scheme == "https" and parsed.netloc:
+                self.player_domain = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+                self.player_domain_host = provider_host
+                self.player_domain_expires = time.time() + 300
+                return self.player_domain
+        except Exception as exc:
+            logger.info("Could not resolve MovieBox player domain: %s", exc)
+        # The API host is not a media-page origin; fall back to the public site.
+        self.player_domain = f"https://{provider_host}"
+        self.player_domain_host = provider_host
+        self.player_domain_expires = time.time() + 60
+        return self.player_domain
+
+    @staticmethod
+    def _player_referer(domain: str, subject_id: str, detail_path: str, season: int, episode: int) -> str:
+        page_path = quote(detail_path or subject_id, safe="/")
+        query = urlencode({
+            "id": subject_id,
+            "type": "/movie/detail",
+            "detailSe": season,
+            "detailEp": episode,
+            "lang": "en",
+        })
+        return f"{domain.rstrip('/')}/spa/videoPlayPage/movies/{page_path}?{query}"
+
     def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> List[Dict[str, Any]]:
         if not detail_path:
             try:
@@ -635,39 +757,70 @@ class MovieBoxEngine:
                 detail_path = details.get("detail_path", "")
             except Exception:
                 detail_path = ""
-        token = None
-        # A guest bearer improves compatibility on some mirrors, but the H5
-        # API often accepts playback requests without it. Do not fail playback
-        # before trying those reachable web endpoints when bootstrap is blocked.
-        try:
-            token = self.bootstrap_token()
-        except Exception as exc:
-            logger.info("Mobile token bootstrap unavailable; trying public playback providers: %s", exc)
+        player_domain = self.get_player_domain()
+        # Web playback requires the guest token issued for the selected web
+        # host. The native API token is a separate credential and can be rejected.
+        provider_host = self.active_h5_host
+        token = self.h5_tokens.get(provider_host) or self.bearer_token
         streams: List[Dict[str, Any]] = []
         seen_urls = set()
+        player_origin = f"https://{provider_host}"
+        player_referer = self._player_referer(player_origin, subject_id, detail_path or "", season, episode)
 
-        for domain in WEB_DOMAINS:
-            play_url = (
-                f"{domain}/wefeed-h5api-bff/subject/play?"
-                f"subjectId={subject_id}&se={season}&ep={episode}&detailPath={detail_path}&"
-                f"streamSignType=1&supportCodecs%5Bhevc%5D=0&supportCodecs%5Bh264%5D=1"
-            )
-            referer = f"{domain}/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe=&detailEp=&lang=en"
+        known_api_hosts = {urlsplit(domain).hostname for domain in WEB_DOMAINS}
+        candidate_domains = list(WEB_DOMAINS)
+        if urlsplit(player_domain).hostname in known_api_hosts:
+            candidate_domains.insert(0, player_domain)
+        candidate_domains = list(dict.fromkeys(candidate_domains))
+        refreshed_web_token = False
+        for domain in candidate_domains:
+            play_query = urlencode({
+                "subjectId": subject_id,
+                "se": season,
+                "ep": episode,
+                "detailPath": detail_path or "",
+                "streamSignType": 1,
+                "supportCodecs[hevc]": 0,
+                "supportCodecs[h264]": 1,
+                "host": provider_host,
+            })
+            play_url = f"{domain}/wefeed-h5api-bff/subject/play?{play_query}"
             headers = {
                 "User-Agent": WEB_USER_AGENT,
-                "Referer": referer,
+                "Referer": player_referer,
+                "Origin": player_origin,
                 "Accept": "application/json",
-                "x-client-info": '{"timezone":"Asia/Calcutta"}',
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "x-client-info": json.dumps({"timezone": "Asia/Dhaka"}, separators=(",", ":")),
                 "x-request-lang": "en",
                 "x-vip-restrict": "0",
                 "x-no-high-risk-restrict": "0",
-                "x-source": "moviebox",
+                "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not/A)Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "cross-site",
             }
             if token:
                 headers["Authorization"] = f"Bearer {token}"
             try:
-                resp = self.session.get(play_url, headers=headers, timeout=12)
+                resp = self.session.get(play_url, headers=headers, timeout=6)
+                if resp.status_code in (401, 403, 441) and not refreshed_web_token:
+                    refreshed_web_token = True
+                    self.h5_tokens.pop(provider_host, None)
+                    try:
+                        self.h5_request("GET", "/home", params={"host": provider_host}, timeout=3, retry_auth=False)
+                        token = self.h5_tokens.get(provider_host) or token
+                        if token:
+                            headers["Authorization"] = f"Bearer {token}"
+                            resp = self.session.get(play_url, headers=headers, timeout=6)
+                    except Exception as exc:
+                        logger.info("H5 playback guest-token refresh failed: %s", exc)
                 if resp.status_code != 200:
+                    logger.info("H5 playback provider returned HTTP %s", resp.status_code, extra={"provider": urlsplit(domain).hostname})
                     continue
                 data = resp.json().get("data", {})
                 raw_streams = data.get("streams", [])
@@ -698,9 +851,9 @@ class MovieBoxEngine:
                             "codec": st.get("codecName"),
                             "duration_sec": st.get("duration"),
                             "headers": {
-                                "User-Agent": "Mozilla/5.0",
-                                "Referer": f"{domain}/",
-                                "Origin": domain,
+                                "User-Agent": WEB_USER_AGENT,
+                                "Referer": player_referer,
+                                "Origin": player_origin,
                             }
                         })
 
@@ -724,9 +877,9 @@ class MovieBoxEngine:
                                 "duration_sec": None,
                                 "cookie": cookie,
                                 "headers": {
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Referer": f"{domain}/",
-                                    "Origin": domain,
+                                    "User-Agent": WEB_USER_AGENT,
+                                    "Referer": player_referer,
+                                    "Origin": player_origin,
                                 }
                             })
                     if streams:
@@ -736,9 +889,7 @@ class MovieBoxEngine:
 
         try:
             native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
-            if not token:
-                raise HTTPException(status_code=502, detail="Mobile playback token unavailable")
-            native_data = self.api_request("GET", native_url).get("data", {})
+            native_data = self.api_request("GET", native_url, timeout=8).get("data", {})
             for st in native_data.get("streams", []):
                 raw_url = st.get("url")
                 if not raw_url or "b164fbfb4347792950bdfbfb563d39d9" in raw_url:
@@ -769,7 +920,8 @@ class MovieBoxEngine:
                     "duration_sec": st.get("duration"),
                     "headers": {
                         "User-Agent": MODERN_USER_AGENT,
-                        "Referer": "https://api3.aoneroom.com/",
+                        "Referer": player_referer,
+                        "Origin": player_origin,
                     }
                 })
         except Exception:
@@ -1028,7 +1180,7 @@ def _get_ranked_catalog(tab_id: int, page: int, per_page: int, expected_type: in
     except Exception as exc:
         logger.info("Mobile catalog unavailable; using H5 home shelves: %s", exc)
     if not raw_items:
-        home = _upstream_data(engine.h5_request("GET", "/home", params={"host": "moviebox.ph"}))
+        home = _upstream_data(engine.h5_request("GET", "/home", params={"host": engine.active_h5_host}))
         for section in home.get("operatingList", []) if isinstance(home, dict) else []:
             if not isinstance(section, dict):
                 continue
@@ -1096,7 +1248,7 @@ def get_tv_series(page: int = Query(1, ge=1, le=100), per_page: int = Query(24, 
 
 @app.get("/home")
 def get_home():
-    return engine.h5_request("GET", "/home", params={"host": "moviebox.ph"})
+    return engine.h5_request("GET", "/home", params={"host": engine.active_h5_host})
 
 @app.get("/{frontend_path:path}", include_in_schema=False)
 def frontend_fallback(frontend_path: str):

@@ -269,7 +269,10 @@ export function VideoPlayer({ streams, captions, allowed, initialPosition = 0, o
     engineRef.current?.destroy();
     const engine = createPlaybackEngine(video, stream, (diagnostic: PlaybackError) => {
       if (import.meta.env.DEV) console.error("[MovieBox playback] DASH error", diagnostic);
-      if (active) { setBuffering(false); setError(`${diagnostic.message}${diagnostic.code ? ` (code ${diagnostic.code})` : ""}`); }
+      if (active && !advanceAfterFailure(streamIndex)) {
+        setBuffering(false);
+        setError(diagnostic.message || "The selected stream could not be loaded.");
+      }
     });
     engineRef.current = engine;
     engine.load(stream, startAt).then(() => {
