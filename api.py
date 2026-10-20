@@ -120,7 +120,9 @@ WEB_DOMAINS = [
 ]
 
 PROXY_SIGNING_SECRET = os.getenv("PROXY_SIGNING_SECRET") or secrets.token_urlsafe(32)
-PROXY_TOKEN_TTL_SECONDS = max(60, int(os.getenv("PROXY_TOKEN_TTL_SECONDS", "900")))
+# Playback URLs are also used by the browser for every DASH segment request.
+# Keep their signatures alive for a full feature film, including pauses.
+PROXY_TOKEN_TTL_SECONDS = max(60, int(os.getenv("PROXY_TOKEN_TTL_SECONDS", "21600")))
 ALLOWED_MEDIA_HOSTS = {
     "aoneroom.com",
     "hakunaymatata.com",
@@ -306,6 +308,29 @@ def _normalize_stream(stream: Dict[str, Any]) -> Dict[str, Any]:
     stream["playback_url"] = f"/api/playback/{_encode_playback_token({'url': url, 'headers': stream.get('headers') or {}, 'cookie': stream.get('cookie') or '', 'kind': 'dash' if is_dash else 'media'})}"
     return stream
 
+
+def _search_items(data: Any) -> List[Dict[str, Any]]:
+    """Accept the list and pager shapes used by the upstream search endpoints."""
+    current = data
+    for _ in range(3):
+        if isinstance(current, list):
+            return [item for item in current if isinstance(item, dict)]
+        if not isinstance(current, dict):
+            return []
+        empty_list = None
+        for key in ("items", "subjects", "list", "results"):
+            value = current.get(key)
+            if isinstance(value, list):
+                items = [item for item in value if isinstance(item, dict)]
+                if items:
+                    return items
+                empty_list = items
+        nested = current.get("data")
+        if not isinstance(nested, (dict, list)):
+            return empty_list or []
+        current = nested
+    return []
+
 class MovieBoxEngine:
     _instance = None
 
@@ -374,30 +399,46 @@ class MovieBoxEngine:
             ("/wefeed-mobile-bff/subject-api/search", {"keyword": query, "page": page, "perPage": per_page}),
         ]
         data = None
+        first_empty_data = None
         last_error: Optional[HTTPException] = None
         for url, payload in variants:
             try:
                 response = self.api_request("POST", url, body_dict=payload)
-                data = response.get("data", {}) if isinstance(response, dict) else {}
-                break
+                candidate = response.get("data", response) if isinstance(response, dict) else response
+                items = _search_items(candidate)
+                if items:
+                    data = items
+                    break
+                if first_empty_data is None:
+                    first_empty_data = items
             except HTTPException as exc:
                 last_error = exc
+            except Exception as exc:
+                logger.warning("search provider request failed", extra={"endpoint": url}, exc_info=True)
+                last_error = HTTPException(status_code=502, detail="Search is unavailable")
+        if data is None and first_empty_data is not None:
+            data = first_empty_data
         if data is None:
             raise last_error or HTTPException(status_code=502, detail="Search is unavailable")
-        raw_items = data.get("items", []) or data.get("list", [])
         results = []
-        for item in raw_items:
-            sub = item.get("subject", item)
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            sub = item.get("subject") if isinstance(item.get("subject"), dict) else item
+            subject_id = sub.get("subjectId") or sub.get("subject_id") or sub.get("id")
+            title = sub.get("title") or sub.get("name")
+            if not subject_id or not title:
+                continue
             results.append({
-                "subject_id": str(sub.get("subjectId")),
-                "title": sub.get("title"),
-                "type": "Movie" if sub.get("subjectType") == 1 else "Series",
-                "subject_type": sub.get("subjectType"),
-                "release_date": sub.get("releaseDate"),
-                "imdb_rating": sub.get("imdbRatingValue"),
+                "subject_id": str(subject_id),
+                "title": title,
+                "type": "Series" if sub.get("subjectType", sub.get("subject_type")) == 2 else "Movie",
+                "subject_type": sub.get("subjectType", sub.get("subject_type")),
+                "release_date": sub.get("releaseDate") or sub.get("release_date"),
+                "imdb_rating": sub.get("imdbRatingValue") or sub.get("imdb_rating"),
                 "genre": sub.get("genre"),
                 "cover": sub.get("cover", {}).get("url") if isinstance(sub.get("cover"), dict) else None,
-                "detail_path": sub.get("detailPath"),
+                "detail_path": sub.get("detailPath") or sub.get("detail_path"),
                 "language": sub.get("language")
             })
         return results
@@ -757,29 +798,24 @@ def search(q: str = Query(..., min_length=1, max_length=120), page: int = Query(
     try:
         results = engine.search(q, page=page, per_page=per_page)
     except HTTPException:
-        # The provider's full search endpoint occasionally fails while its
-        # autocomplete endpoint remains available. Keep the search page useful
-        # in that case, while preserving the original error if both fail.
-        if page != 1:
-            raise
-        try:
-            suggestions = search_suggest(q).get("suggestions", [])
-            results = [
-                {
-                    "subject_id": item.get("subject_id"),
-                    "title": item.get("title"),
-                    "type": item.get("type", "Movie"),
-                    "subject_type": 2 if item.get("type") == "Series" else 1,
-                    "detail_path": item.get("slug"),
-                }
-                for item in suggestions
-                if item.get("title") and item.get("subject_id")
-                and str(item.get("subject_id")).lower() not in {"none", "null", "undefined"}
-            ]
-            if not results:
-                raise
-        except Exception:
-            raise
+        results = []
+    # A successful but empty response can also mean that the provider accepted
+    # an obsolete search contract. Autocomplete remains a useful first-page
+    # fallback in that case.
+    if not results and page == 1:
+        suggestions = search_suggest(q).get("suggestions", [])
+        results = [
+            {
+                "subject_id": item["subject_id"],
+                "title": item["title"],
+                "type": item.get("type", "Movie"),
+                "subject_type": 2 if item.get("type") == "Series" else 1,
+                "detail_path": item.get("slug"),
+            }
+            for item in suggestions
+            if item.get("title") and item.get("subject_id")
+            and str(item.get("subject_id")).lower() not in {"none", "null", "undefined"}
+        ]
     return {"query": q, "page": page, "results": results}
 
 @app.get("/search/suggest")
@@ -788,19 +824,22 @@ def search_suggest(q: str = Query(..., min_length=1, max_length=120)):
     headers = {"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}
     try:
         resp = engine.session.post(url, headers=headers, json={"keyword": q, "perPage": 10}, timeout=15)
-        raw = resp.json().get("data", {}).get("items", [])
+        response = resp.json()
+        raw = _search_items(response.get("data", response) if isinstance(response, dict) else response)
     except Exception:
         raw = []
     suggestions = []
     for item in raw:
-        sub = item.get("subject") or {}
+        sub = item.get("subject") if isinstance(item.get("subject"), dict) else item
+        subject_id = sub.get("subjectId") or sub.get("subject_id") or sub.get("id") or item.get("subjectId")
+        title = sub.get("title") or sub.get("name") or item.get("word") or item.get("title")
         suggestions.append({
-            "title": sub.get("title") or item.get("word") or item.get("title"),
-            "slug": sub.get("detailPath") or item.get("detailPath"),
-            "subject_id": str(sub.get("subjectId") or item.get("subjectId")),
-            "type": "Series" if sub.get("subjectType") == 2 else "Movie"
+            "title": title,
+            "slug": sub.get("detailPath") or sub.get("detail_path") or item.get("detailPath"),
+            "subject_id": str(subject_id) if subject_id else None,
+            "type": "Series" if sub.get("subjectType", sub.get("subject_type")) == 2 else "Movie"
         })
-    return {"suggestions": suggestions}
+    return {"suggestions": [item for item in suggestions if item.get("title")]}
 
 @app.get("/detail/{subject_id}")
 def get_detail(subject_id: str):

@@ -9,7 +9,7 @@ services:
       - key: PROXY_SIGNING_SECRET
         generateValue: true
       - key: PROXY_TOKEN_TTL_SECONDS
-        value: "900"
+        value: "21600"
       - key: VITE_ENABLE_ADS
         value: "true"
       - key: VITE_ENABLE_PREPLAY_AD
